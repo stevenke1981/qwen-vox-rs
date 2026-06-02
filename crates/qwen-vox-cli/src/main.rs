@@ -7,11 +7,15 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use qwen_vox_core::device::DeviceManager;
-use qwen_vox_core::pipeline::TtsPipeline;
+use qwen_vox_core::pipeline::{TtsPipeline, TOKENIZER_FRAME_RATE_HZ, TOKENIZER_SAMPLE_RATE};
 use qwen_vox_core::talker::Talker;
 use qwen_vox_core::tokenizer::Tokenizer;
 use qwen_vox_core::weights::WeightStore;
 use std::path::PathBuf;
+
+const AUTO_MAX_FRAMES_SENTINEL: usize = 0;
+const AUTO_MIN_SECONDS: f32 = 3.0;
+const AUTO_MAX_FRAMES: usize = 512;
 
 #[derive(Parser)]
 #[command(
@@ -64,8 +68,8 @@ enum Commands {
         #[arg(long, default_value = "english")]
         language: String,
 
-        /// Maximum codec frames to generate. 12 frames is about one second at 12 Hz.
-        #[arg(long, default_value_t = 48)]
+        /// Maximum codec frames to generate. Use 0 to auto-estimate from text length.
+        #[arg(long, default_value_t = AUTO_MAX_FRAMES_SENTINEL)]
         max_frames: usize,
     },
 
@@ -105,7 +109,10 @@ fn main() -> Result<()> {
             tracing::info!("Weights: {}", weights.display());
             tracing::info!("Decoder weights: {}", decoder_weights.display());
             tracing::info!("Tokenizer: {}", tokenizer.display());
-            tracing::info!("Language: {language}, max_frames={max_frames}");
+            let effective_max_frames = resolve_max_frames(&text, max_frames);
+            tracing::info!(
+                "Language: {language}, max_frames={max_frames}, effective_max_frames={effective_max_frames}"
+            );
 
             generate_qwen3_tts(
                 &text,
@@ -115,7 +122,7 @@ fn main() -> Result<()> {
                 &tokenizer,
                 dev_mgr.device(),
                 &language,
-                max_frames,
+                effective_max_frames,
             )
             .with_context(|| {
                 format!(
@@ -214,8 +221,53 @@ fn generate_qwen3_tts(
     let waveform = pipeline
         .decode_frame_codes(&frames)
         .context("Qwen3-TTS codec decoder failed")?;
-    write_tensor_wav(output, 24_000, &waveform)?;
+    write_tensor_wav(output, TOKENIZER_SAMPLE_RATE, &waveform)?;
     Ok(())
+}
+
+fn resolve_max_frames(text: &str, requested: usize) -> usize {
+    if requested != AUTO_MAX_FRAMES_SENTINEL {
+        return requested;
+    }
+    auto_max_frames(text)
+}
+
+fn auto_max_frames(text: &str) -> usize {
+    let seconds = estimate_speech_seconds(text).clamp(AUTO_MIN_SECONDS, 60.0);
+    ((seconds * TOKENIZER_FRAME_RATE_HZ).ceil() as usize + 8).min(AUTO_MAX_FRAMES)
+}
+
+fn estimate_speech_seconds(text: &str) -> f32 {
+    let cjk_chars = text.chars().filter(|&ch| is_cjk(ch)).count() as f32;
+    let words = text
+        .split_whitespace()
+        .filter(|part| part.chars().any(|ch| ch.is_ascii_alphanumeric()))
+        .count() as f32;
+    let punctuation_pauses = text
+        .chars()
+        .filter(|ch| {
+            matches!(
+                ch,
+                '.' | ',' | ';' | ':' | '?' | '!' | '。' | '，' | '；' | '：' | '？' | '！'
+            )
+        })
+        .count() as f32
+        * 0.12;
+
+    0.8 + (cjk_chars / 4.5) + (words / 2.5) + punctuation_pauses
+}
+
+fn is_cjk(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xF900..=0xFAFF
+            | 0x20000..=0x2A6DF
+            | 0x2A700..=0x2B73F
+            | 0x2B740..=0x2B81F
+            | 0x2B820..=0x2CEAF
+    )
 }
 
 fn qwen3_prompt(text: &str) -> String {
@@ -268,4 +320,29 @@ fn write_wav(path: &PathBuf, sample_rate: u32, samples: &[f32]) -> Result<()> {
     }
     writer.finalize()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manual_max_frames_is_preserved() {
+        assert_eq!(resolve_max_frames("hello", 12), 12);
+    }
+
+    #[test]
+    fn auto_max_frames_gives_audible_minimum() {
+        assert!(resolve_max_frames("hello", 0) >= 45);
+    }
+
+    #[test]
+    fn auto_max_frames_scales_for_long_text() {
+        let short = resolve_max_frames("hello", 0);
+        let long = resolve_max_frames(
+            "Hello from Qwen three TTS. This sentence is deliberately longer and should get more codec frames.",
+            0,
+        );
+        assert!(long > short);
+    }
 }

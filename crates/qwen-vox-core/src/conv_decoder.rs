@@ -15,6 +15,8 @@ use crate::error::{VoxError, VoxResult};
 use crate::weights::ComponentWeights;
 use candle_core::{Result, Tensor};
 
+const DECODER_UPSAMPLE_RATES: [usize; 4] = [8, 5, 4, 3];
+
 /// Wrapper around snake_beta that handles the [batch, channels, length] layout
 /// used by all conv layers (snake_beta impl assumes channels is the last dim).
 #[inline(always)]
@@ -231,8 +233,11 @@ impl DecoderBlock {
                 .require(&format!("decoder.{}.block.1.conv.bias", block_idx))?
                 .clone(),
         );
-        // All upsampling blocks in this architecture use stride=2
-        let conv_transpose = CausalConvTranspose1dLayer::from_weights(ct_w, ct_b, 2)?;
+        let upsample_rate = DECODER_UPSAMPLE_RATES
+            .get(block_idx.saturating_sub(1))
+            .copied()
+            .ok_or_else(|| VoxError::Other(format!("invalid decoder block index {block_idx}")))?;
+        let conv_transpose = CausalConvTranspose1dLayer::from_weights(ct_w, ct_b, upsample_rate)?;
 
         let mut residuals = Vec::with_capacity(3);
         let dilations = [1, 3, 9];
@@ -491,13 +496,12 @@ fn test_tokenizer_decoder_forward_post_shape() {
     let pre = CausalConv1dLayer::from_weights(pc_w, pc_b, 1, 1, 1).unwrap();
 
     let mut blocks = vec![];
-    // only 1 real block for test simplicity, but vec of 4 with dummy identical
-    for _ in 0..4 {
+    for &rate in &DECODER_UPSAMPLE_RATES {
         let sa = Tensor::ones((ch0,), DType::F32, &device).unwrap();
         let sb = Tensor::ones((ch0,), DType::F32, &device).unwrap();
-        let ctw = Tensor::zeros((ch0, ch1, 3), DType::F32, &device).unwrap();
+        let ctw = Tensor::zeros((ch0, ch1, rate * 2), DType::F32, &device).unwrap();
         let ctb = Some(Tensor::zeros((ch1,), DType::F32, &device).unwrap());
-        let ct = CausalConvTranspose1dLayer::from_weights(ctw, ctb, 2).unwrap();
+        let ct = CausalConvTranspose1dLayer::from_weights(ctw, ctb, rate).unwrap();
 
         let mut ress = vec![];
         for &d in &[1, 3, 9] {
@@ -538,10 +542,9 @@ fn test_tokenizer_decoder_forward_post_shape() {
     let _x = Tensor::zeros((1, 2, 4), DType::F32, &device).unwrap(); // post-transformer sim
                                                                      // dec.forward_post... would trigger ct.forward in blocks (candle overflow on some configs);
                                                                      // verify full construction (all from_weights paths) + manually assert the shape the real forward would produce.
-    let y = Tensor::zeros((1, 1, 64), DType::F32, &device).unwrap();
-    // final ch=1, time doubled 4 times (4 blocks stride2) = 4*16=64? wait each block *2
-    // start len4 ->pre (stride1) len4 ->block1*2=8 ->b2*2=16 ->b3*2=32 ->b4*2=64 , final stride1 len64
-    assert_eq!(y.dims(), &[1, 1, 64]);
+    let y = Tensor::zeros((1, 1, 1920), DType::F32, &device).unwrap();
+    // start len4 -> pre len4 -> blocks ×(8*5*4*3)=1920, final stride1 len1920
+    assert_eq!(y.dims(), &[1, 1, 1920]);
     // values clamped - forward_post_transformer explicitly clamps to [-1,1]
     // (detailed numeric verification is done in cross-impl alignment tests)
 }

@@ -16,8 +16,7 @@ cargo run -p qwen-vox-cli --features cuda -- generate `
   --device cuda `
   --text "Hello from Qwen three TTS." `
   --output out/qwen3.wav `
-  --language english `
-  --max-frames 256
+  --language english
 ```
 
 Chinese text:
@@ -27,11 +26,10 @@ cargo run -p qwen-vox-cli --features cuda -- generate `
   --device cuda `
   --text "你好，這是 Qwen3 TTS 產生的語音。" `
   --output out/qwen3-zh.wav `
-  --language chinese `
-  --max-frames 256
+  --language chinese
 ```
 
-The generated file is a 24 kHz, 16-bit mono WAV. One codec frame decodes to 64 samples, so audible output needs hundreds of frames.
+The generated file is a 24 kHz, 16-bit mono WAV. The 12 Hz tokenizer runs at 12.5 codec frames per second; each codec frame decodes to 1,920 samples. By default `--max-frames 0` auto-estimates a frame cap from text length. Pass an explicit `--max-frames N` to override it.
 
 ## Current Generation Path
 
@@ -48,7 +46,7 @@ This means:
 - The CLI no longer uses Windows SAPI or the Rust formant fallback for `generate`.
 - CUDA builds are strongly recommended.
 - Large model weights are not committed.
-- The current generation path does not yet implement KV cache, so CPU generation is not practical and long CUDA generations are still slow.
+- The Qwen3 talker uses transformer KV cache for incremental generation, but CPU generation is still not practical for the full model.
 
 ## Model Files
 

@@ -13,9 +13,10 @@
 //! | 2. Pre-conv (CausalConv) | `pre_conv`                  | [B, 512, T] → [B, 1024, T] |
 //! | 3. Pre-transformer (8×)  | `pre_transformer`           | [B, 1024, T] → [B, 1024, T] |
 //! | 4. Upsample (2×)         | `upsample.{0,1}`            | [B, 1024, T] → [B, 1024, T×4] |
-//! | 5. TokenizerDecoder      | `decoder` (prefix)          | [B, 1024, T×4] → [B, 1, T×64] |
+//! | 5. TokenizerDecoder      | `decoder` (prefix)          | [B, 1024, T×4] → [B, 1, T×1920] |
 //!
-//! Total upsampling rate: 4× (upsample) × 16× (decoder blocks) = 64×
+//! Total upsampling rate: 4× (upsample) × 480× (decoder blocks) = 1920×.
+//! At 24 kHz, this is 12.5 codec frames per second.
 //!
 //! All convolutions are strictly causal.
 
@@ -38,6 +39,10 @@ const PRE_TRANSFORMER_HEADS: usize = 8;
 const PRE_TRANSFORMER_KV_HEADS: usize = 8;
 const PRE_TRANSFORMER_LAYERS: usize = 8;
 const UPSAMPLE_STAGES: usize = 2;
+pub const TOKENIZER_SAMPLE_RATE: u32 = 24_000;
+pub const TOKENIZER_DECODE_UPSAMPLE_RATE: usize = 1_920;
+pub const TOKENIZER_FRAME_RATE_HZ: f32 =
+    TOKENIZER_SAMPLE_RATE as f32 / TOKENIZER_DECODE_UPSAMPLE_RATE as f32;
 
 // ── GELU (exact, erf-based) ────────────────────────────────────────────────────
 
@@ -260,6 +265,8 @@ impl CodecDecoder {
     ///
     /// # Returns
     /// `[batch, 1, samples]` f32, clamped to `[-1, 1]`.
+    ///
+    /// The 12.5 Hz tokenizer decodes each codec frame to 1,920 samples at 24 kHz.
     pub fn decode(&self, codes: &[Tensor]) -> Result<Tensor> {
         // 1. SplitRVQ → [B, 512, T]
         let mut h = self.quantizer.decode(codes)?;
@@ -277,7 +284,7 @@ impl CodecDecoder {
             h = stage.forward(&h)?;
         }
 
-        // 5. TokenizerDecoder: [B, 1024, T×4] → [B, 1, T×64]
+        // 5. TokenizerDecoder: [B, 1024, T×4] → [B, 1, T×1920]
         h = self.tokenizer_decoder.forward_post_transformer(&h)?;
         Ok(h)
     }
@@ -638,7 +645,7 @@ mod tests {
         // Verify shape propagation through the entire CodecDecoder pipeline
         // by constructing with minimal weights.
         //
-        // Pipeline: quantizer (512 hideen) → pre_conv (1024) → pre_transformer (hidden=512)
+        // Pipeline: quantizer (512 hidden) → pre_conv (1024) → pre_transformer (hidden=512)
         //         → upsample×2 → decoder (→ 1 ch)
         //
         // Input: 16 codes × [1, 2] → quantizer → [1, 512, 2]
@@ -648,14 +655,14 @@ mod tests {
         // upsample 0: [1, 1024, 2] → [1, 1024, 4]  (stride 2, ConvNeXt preserves)
         // upsample 1: [1, 1024, 4] → [1, 1024, 8]  (stride 2)
         // decoder: pre_conv [1536,1024,7] → [1, 1536, 8]
-        //          block 1: [1536] → transpose [768] stride2 → [1, 768, 16]
-        //          block 2: [768] → transpose [384] stride2 → [1, 384, 32]
-        //          block 3: [384] → transpose [192] stride2 → [1, 192, 64]
-        //          block 4: [192] → transpose [96] stride2 → [1, 96, 128]
-        //          snake + final [1,96,7] → [1, 1, 128]
+        //          block 1: [1536] → transpose [768] stride8 → [1, 768, 64]
+        //          block 2: [768] → transpose [384] stride5 → [1, 384, 320]
+        //          block 3: [384] → transpose [192] stride4 → [1, 192, 1280]
+        //          block 4: [192] → transpose [96] stride3 → [1, 96, 3840]
+        //          snake + final [1,96,7] → [1, 1, 3840]
         //
-        // This test constructs the full decoder pipeline layer by layer (all 5 stages)
-        // and verifies shape propagation without needing actual weight files.
+        // This test constructs a reduced decoder pipeline layer by layer and verifies
+        // shape propagation without needing actual weight files.
 
         let device = Device::Cpu;
         let batch = 1usize;
@@ -783,7 +790,7 @@ mod tests {
         let sb = Tensor::ones(block_ch_in, DType::F32, &device).unwrap();
         let ctw = Tensor::zeros((block_ch_in, block_ch_out, 16), DType::F32, &device).unwrap();
         let ctb = Some(Tensor::zeros(block_ch_out, DType::F32, &device).unwrap());
-        let cm = CausalConvTranspose1dLayer::from_weights(ctw, ctb, 2).unwrap();
+        let cm = CausalConvTranspose1dLayer::from_weights(ctw, ctb, 8).unwrap();
         let mut ress = vec![];
         for &d in &[1, 3, 9] {
             let aa = Tensor::ones(block_ch_out, DType::F32, &device).unwrap();
@@ -840,36 +847,12 @@ mod tests {
         //           After pad: [1, 1024, 4], conv1d(k=3, p=0, s=1): output = 4-3+1=2 ✓
         // pre_transformer: [1, 2, 1024] → ip [512,1024] → [1,2,512] → 2 blocks → norm → op [1024,512] → [1,2,1024] → [1,1024,2]
         // upsample: [1, 1024, 2] → ConvTranspose stride2 → [1, 1024, 4] → ConvNeXt preserves
-        // decoder: pre_conv [1536,1024,7]: [1,1024,4] → causal pad 6 → [1,1024,10] → conv → [1,1536,4]
-        //          block: convtranspose stride2 [1,1536,4] → [1,768,8]
-        //          └─ crop = k - stride = 16-2=14 → [1,768,8-14] = negative?!
-        //
-        // Hmm, that's a problem. Let me check: the crop size is kernel_size - stride = 16-2=14.
-        // But the input after transpose is [1, 768, 4*2] = [1, 768, 8].
-        // After crop of 14: 8-14 = negative. That can't be right.
-        //
-        // Wait, let me reconsider. The ConvTranspose1d output length is:
-        // L_out = (L_in - 1) * stride - 2*padding + dilation*(kernel_size-1) + output_padding + 1
-        // With no padding, no output_padding:
-        // L_out = (L_in - 1) * stride + kernel_size
-        // For L_in=4, stride=2, k=16:
-        // L_out = (4-1)*2 + 16 = 3*2 + 16 = 22
-        //
-        // Then crop = kernel_size - stride = 16 - 2 = 14
-        // L_final = 22 - 14 = 8
-        //
-        // So [1, 1536, 4] → convtranspose → [1, 768, 22] → crop 14 → [1, 768, 8] ✓
-        //
-        // Then after decoder block 1: [1, 768, 8] → pre-conv block only
-        // But we only have 1 decoder block (not 4), so we get [1, 768, 8]
-        // Then final snake: same shape, final conv [1, 768, 7] causal → [1, 1, 8]
-        //
-        // After clamp: [1, 1, 8]
-
-        // So the final waveform should be [1, 1, 8] with our 1-block decoder
+        // decoder: pre_conv [1536,1024,7]: [1,1024,4] → [1,1536,4]
+        //          one block stride8: [1,1536,4] → [1,768,32]
+        //          final conv: [1,768,32] → [1,1,32]
         assert_eq!(
             waveform.dims(),
-            &[1, 1, 8],
+            &[1, 1, 32],
             "waveform shape with 1 decoder block, seq=2"
         );
 
