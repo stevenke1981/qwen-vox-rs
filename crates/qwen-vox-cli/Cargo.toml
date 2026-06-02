@@ -17,6 +17,7 @@ metal = ["qwen-vox-core/metal"]
 
 [dependencies]
 qwen-vox-core = { workspace = true }
+candle-core = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

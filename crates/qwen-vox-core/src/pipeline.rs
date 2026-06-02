@@ -425,6 +425,10 @@ impl TtsPipeline {
         self
     }
 
+    pub fn talker(&self) -> Option<&Talker> {
+        self.talker.as_ref()
+    }
+
     /// Extract speaker embedding from reference mel spectrogram.
     /// Returns `None` if no speaker encoder is attached.
     pub fn extract_speaker(&self, mel: &Tensor) -> candle_core::Result<Option<Tensor>> {
@@ -439,6 +443,32 @@ impl TtsPipeline {
         self.codec_decoder
             .decode(codes)
             .map_err(|e| VoxError::Inference(e.to_string()))
+    }
+
+    pub fn decode_frame_codes(&self, frames: &[[u16; 16]]) -> VoxResult<Tensor> {
+        if frames.is_empty() {
+            return Err(VoxError::Inference("no codec frames to decode".into()));
+        }
+
+        let num_frames = frames.len();
+        let mut code_seqs: Vec<Vec<u16>> =
+            (0..16).map(|_| Vec::with_capacity(num_frames)).collect();
+        for frame in frames {
+            for (level, &code) in frame.iter().enumerate() {
+                code_seqs[level].push(code);
+            }
+        }
+
+        let device = self.codec_decoder.device().clone();
+        let mut code_tensors = Vec::with_capacity(16);
+        for seq in &code_seqs {
+            let u32_seq: Vec<u32> = seq.iter().map(|&c| c as u32).collect();
+            code_tensors.push(Tensor::from_vec(u32_seq, (1, num_frames), &device)?);
+        }
+
+        self.codec_decoder
+            .decode(&code_tensors)
+            .map_err(|e| VoxError::Inference(format!("CodecDecoder decode: {e}")))
     }
 
     /// High-level synthesis entry point.
@@ -463,35 +493,7 @@ impl TtsPipeline {
         if frames.is_empty() {
             return Err(VoxError::Inference("Talker generated zero frames".into()));
         }
-        let num_frames = frames.len();
-
-        // 2. Transpose frames into 16 code sequences (one per RVQ level)
-        //    frames[0] = [q0_frame0, q1_frame0, ... q15_frame0]
-        //    We need: codes[0] = [q0_frame0, q0_frame1, ... q0_frameN]
-        let mut code_seqs: Vec<Vec<u16>> =
-            (0..16).map(|_| Vec::with_capacity(num_frames)).collect();
-        for frame in &frames {
-            for (level, &code) in frame.iter().enumerate() {
-                code_seqs[level].push(code);
-            }
-        }
-
-        // 3. Convert each sequence to a [1, num_frames] u32 tensor
-        let device = self.codec_decoder.device().clone();
-        let mut code_tensors: Vec<Tensor> = Vec::with_capacity(16);
-        for seq in &code_seqs {
-            let u32_seq: Vec<u32> = seq.iter().map(|&c| c as u32).collect();
-            let t = Tensor::from_vec(u32_seq, (1, num_frames), &device)?;
-            code_tensors.push(t);
-        }
-
-        // 4. CodecDecoder → waveform
-        let waveform = self
-            .codec_decoder
-            .decode(&code_tensors)
-            .map_err(|e| VoxError::Inference(format!("CodecDecoder decode: {e}")))?;
-
-        Ok(waveform)
+        self.decode_frame_codes(&frames)
     }
 }
 

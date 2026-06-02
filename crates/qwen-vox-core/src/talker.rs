@@ -97,6 +97,7 @@ pub struct Talker {
     small_to_mtp_b: Tensor,           // [1024]
     cp_transformer: TransformerStack, // 5 layers (no QK norms, no LayerScale)
     cp_lm_heads: Vec<Tensor>,         // 15 × [2048, 1024]
+    cp_codec_embeddings: Vec<Tensor>, // 15 × [2048, 2048]
 }
 
 impl Talker {
@@ -109,7 +110,7 @@ impl Talker {
         let device = store.device().clone();
 
         // ── 1. Embeddings ──
-        let text_embedding = store.require("talker.model.embed_tokens.weight")?.clone();
+        let text_embedding = store.require("talker.model.text_embedding.weight")?.clone();
         Self::check_shape(&text_embedding, &[TEXT_VOCAB, HIDDEN], "text_embedding")?;
 
         let codec_embedding = store
@@ -119,18 +120,18 @@ impl Talker {
 
         // ── 2. Text projection ──
         let text_proj_fc1_w = store
-            .require("talker.model.text_projection.fc1.weight")?
+            .require("talker.text_projection.linear_fc1.weight")?
             .clone();
         Self::check_shape(&text_proj_fc1_w, &[HIDDEN, HIDDEN], "text_proj.fc1.w")?;
         let text_proj_fc1_b = store
-            .require("talker.model.text_projection.fc1.bias")?
+            .require("talker.text_projection.linear_fc1.bias")?
             .clone();
         let text_proj_fc2_w = store
-            .require("talker.model.text_projection.fc2.weight")?
+            .require("talker.text_projection.linear_fc2.weight")?
             .clone();
         Self::check_shape(&text_proj_fc2_w, &[HIDDEN, HIDDEN], "text_proj.fc2.w")?;
         let text_proj_fc2_b = store
-            .require("talker.model.text_projection.fc2.bias")?
+            .require("talker.text_projection.linear_fc2.bias")?
             .clone();
 
         // ── 3. Backbone layers ──
@@ -178,11 +179,17 @@ impl Talker {
 
         // 15 lm_heads
         let mut cp_lm_heads = Vec::with_capacity(NUM_RESIDUAL_CODES);
+        let mut cp_codec_embeddings = Vec::with_capacity(NUM_RESIDUAL_CODES);
         for i in 0..NUM_RESIDUAL_CODES {
-            let key = format!("talker.code_predictor.lm_heads.{i}.weight");
+            let key = format!("talker.code_predictor.lm_head.{i}.weight");
             let head = store.require(&key)?.clone();
             Self::check_shape(&head, &[CODEBOOK_SIZE, CP_HIDDEN], &key)?;
             cp_lm_heads.push(head);
+
+            let emb_key = format!("talker.code_predictor.model.codec_embedding.{i}.weight");
+            let emb = store.require(&emb_key)?.clone();
+            Self::check_shape(&emb, &[CODEBOOK_SIZE, HIDDEN], &emb_key)?;
+            cp_codec_embeddings.push(emb);
         }
 
         Ok(Self {
@@ -199,6 +206,7 @@ impl Talker {
             small_to_mtp_b: smtp_b,
             cp_transformer,
             cp_lm_heads,
+            cp_codec_embeddings,
         })
     }
 
@@ -241,6 +249,31 @@ impl Talker {
         let emb = self.codec_embedding.index_select(&t, 0)?; // [1, 2048]
         let emb = emb.unsqueeze(0)?; // [1, 1, 2048]
         Ok(emb)
+    }
+
+    fn embed_residual_code(&self, level: usize, token: u32) -> VoxResult<Tensor> {
+        let device = self.cp_codec_embeddings[level].device();
+        let t = Tensor::new(&[token], device)?;
+        let emb = self.cp_codec_embeddings[level].index_select(&t, 0)?;
+        Ok(emb.unsqueeze(0)?)
+    }
+
+    fn embed_codec_frame(&self, frame: &[u16; 16]) -> VoxResult<Tensor> {
+        let mut emb = self.embed_code_token(frame[0] as u32)?;
+        for (level, &code) in frame.iter().enumerate().skip(1) {
+            let residual = self.embed_residual_code(level - 1, code as u32)?;
+            emb = emb.add(&residual)?;
+        }
+        Ok(emb)
+    }
+
+    fn embed_codec_prefill(&self, ids: &[u32]) -> VoxResult<Tensor> {
+        let mut parts = Vec::with_capacity(ids.len());
+        for &id in ids {
+            parts.push(self.embed_code_token(id)?);
+        }
+        let refs: Vec<&Tensor> = parts.iter().collect();
+        Ok(Tensor::cat(&refs, 1)?)
     }
 
     // ── Backbone Forward ───────────────────────────────────────────────────────
@@ -350,6 +383,94 @@ impl Talker {
         Ok(frames)
     }
 
+    /// Generate codec frames using the Qwen3-TTS base prompt layout.
+    ///
+    /// `input_tokens` should be the ChatML-style text prompt used by the
+    /// official pipeline:
+    /// `<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n`.
+    pub fn generate_qwen3_base(
+        &self,
+        input_tokens: &[u32],
+        language_id: Option<u32>,
+        max_frames: usize,
+    ) -> VoxResult<Vec<[u16; 16]>> {
+        if input_tokens.len() < 9 {
+            return Err(VoxError::Inference(
+                "Qwen3-TTS prompt must contain role/text/end tokens".into(),
+            ));
+        }
+
+        let tts_bos_embed = self.encode_text(&[TTS_BOS])?;
+        let tts_eos_embed = self.encode_text(&[TTS_EOS])?;
+        let tts_pad_embed = self.encode_text(&[TTS_PAD])?;
+
+        let mut codec_prefill = match language_id {
+            Some(id) => vec![2154, 2156, id, 2157],
+            None => vec![2155, 2156, 2157],
+        };
+        codec_prefill.push(2148);
+        codec_prefill.push(2149);
+
+        let role_embed = self.encode_text(&input_tokens[..3])?;
+        let codec_embed = self.embed_codec_prefill(&codec_prefill)?;
+        let codec_len = codec_prefill.len();
+
+        let pad_count = codec_len.saturating_sub(2);
+        let mut prefill_text_parts = Vec::with_capacity(pad_count + 1);
+        for _ in 0..pad_count {
+            prefill_text_parts.push(&tts_pad_embed);
+        }
+        prefill_text_parts.push(&tts_bos_embed);
+        let text_prefill = Tensor::cat(&prefill_text_parts, 1)?;
+        let codec_without_last = codec_embed.narrow(1, 0, codec_len - 1)?;
+        let prefill_embed = text_prefill.add(&codec_without_last)?;
+
+        let first_text = self
+            .encode_text(&input_tokens[3..4])?
+            .add(&codec_embed.narrow(1, codec_len - 1, 1)?)?;
+
+        let mut input_hidden = Tensor::cat(&[&role_embed, &prefill_embed, &first_text], 1)?;
+
+        let mut trailing_parts = Vec::new();
+        if input_tokens.len() > 9 {
+            trailing_parts.push(self.encode_text(&input_tokens[4..input_tokens.len() - 5])?);
+        }
+        trailing_parts.push(tts_eos_embed);
+        let trailing_refs: Vec<&Tensor> = trailing_parts.iter().collect();
+        let trailing_text_hidden = Tensor::cat(&trailing_refs, 1)?;
+
+        let mut frames = Vec::with_capacity(max_frames.min(512));
+        for step in 0..max_frames {
+            let hidden = self
+                .backbone_forward(&input_hidden)
+                .map_err(|e| VoxError::Inference(format!("backbone forward: {e}")))?;
+            let (q0, residual_codes) = self.predict_codes(&hidden)?;
+
+            let mut frame = [0u16; 16];
+            frame[0] = q0;
+            for (i, &rc) in residual_codes.iter().enumerate() {
+                frame[i + 1] = rc;
+            }
+            frames.push(frame);
+
+            if q0 as u32 == CODEC_EOS {
+                break;
+            }
+
+            let mut next_embed = self.embed_codec_frame(&frame)?;
+            let text_add = if step < trailing_text_hidden.dim(1)? {
+                trailing_text_hidden.narrow(1, step, 1)?
+            } else {
+                tts_pad_embed.clone()
+            };
+            next_embed = next_embed.add(&text_add)?;
+            input_hidden = Tensor::cat(&[&input_hidden, &next_embed], 1)
+                .map_err(|e| VoxError::Inference(format!("cat generated embed: {e}")))?;
+        }
+
+        Ok(frames)
+    }
+
     // ── Weight Loading Helpers ─────────────────────────────────────────────────
 
     /// Load one backbone transformer block (28 total).
@@ -400,17 +521,14 @@ impl Talker {
                 .clone(),
         );
 
-        // LayerScale
-        let als = Some(
-            store
-                .require(&format!("{prefix}.self_attn_layer_scale.scale"))?
-                .clone(),
-        );
-        let mls = Some(
-            store
-                .require(&format!("{prefix}.mlp_layer_scale.scale"))?
-                .clone(),
-        );
+        // LayerScale is present in some exported alignment fixtures, but the
+        // official Qwen3-TTS talker weights omit it.
+        let als = store
+            .get(&format!("{prefix}.self_attn_layer_scale.scale"))
+            .cloned();
+        let mls = store
+            .get(&format!("{prefix}.mlp_layer_scale.scale"))
+            .cloned();
 
         TransformerBlock::from_weights(
             q,
@@ -546,7 +664,7 @@ mod tests {
 
         // Embeddings
         store.insert_tensor(
-            "talker.model.embed_tokens.weight",
+            "talker.model.text_embedding.weight",
             Tensor::zeros((TEXT_VOCAB, HIDDEN), DType::F32, &device).unwrap(),
         );
         store.insert_tensor(
@@ -556,19 +674,19 @@ mod tests {
 
         // Text projection
         store.insert_tensor(
-            "talker.model.text_projection.fc1.weight",
+            "talker.text_projection.linear_fc1.weight",
             Tensor::zeros((HIDDEN, HIDDEN), DType::F32, &device).unwrap(),
         );
         store.insert_tensor(
-            "talker.model.text_projection.fc1.bias",
+            "talker.text_projection.linear_fc1.bias",
             Tensor::zeros(HIDDEN, DType::F32, &device).unwrap(),
         );
         store.insert_tensor(
-            "talker.model.text_projection.fc2.weight",
+            "talker.text_projection.linear_fc2.weight",
             Tensor::zeros((HIDDEN, HIDDEN), DType::F32, &device).unwrap(),
         );
         store.insert_tensor(
-            "talker.model.text_projection.fc2.bias",
+            "talker.text_projection.linear_fc2.bias",
             Tensor::zeros(HIDDEN, DType::F32, &device).unwrap(),
         );
 
@@ -698,8 +816,12 @@ mod tests {
 
         for i in 0..NUM_RESIDUAL_CODES {
             store.insert_tensor(
-                format!("talker.code_predictor.lm_heads.{i}.weight"),
+                format!("talker.code_predictor.lm_head.{i}.weight"),
                 Tensor::zeros((CODEBOOK_SIZE, CP_HIDDEN), DType::F32, &device).unwrap(),
+            );
+            store.insert_tensor(
+                format!("talker.code_predictor.model.codec_embedding.{i}.weight"),
+                Tensor::zeros((CODEBOOK_SIZE, HIDDEN), DType::F32, &device).unwrap(),
             );
         }
 
@@ -803,7 +925,7 @@ mod tests {
 
         // Embeddings
         store.insert_tensor(
-            "talker.model.embed_tokens.weight",
+            "talker.model.text_embedding.weight",
             Tensor::zeros((TEXT_VOCAB, HIDDEN), DType::F32, device).unwrap(),
         );
         store.insert_tensor(
@@ -813,19 +935,19 @@ mod tests {
 
         // Text projection
         store.insert_tensor(
-            "talker.model.text_projection.fc1.weight",
+            "talker.text_projection.linear_fc1.weight",
             Tensor::zeros((HIDDEN, HIDDEN), DType::F32, device).unwrap(),
         );
         store.insert_tensor(
-            "talker.model.text_projection.fc1.bias",
+            "talker.text_projection.linear_fc1.bias",
             Tensor::zeros(HIDDEN, DType::F32, device).unwrap(),
         );
         store.insert_tensor(
-            "talker.model.text_projection.fc2.weight",
+            "talker.text_projection.linear_fc2.weight",
             Tensor::zeros((HIDDEN, HIDDEN), DType::F32, device).unwrap(),
         );
         store.insert_tensor(
-            "talker.model.text_projection.fc2.bias",
+            "talker.text_projection.linear_fc2.bias",
             Tensor::zeros(HIDDEN, DType::F32, device).unwrap(),
         );
 
@@ -953,8 +1075,12 @@ mod tests {
 
         for i in 0..NUM_RESIDUAL_CODES {
             store.insert_tensor(
-                format!("talker.code_predictor.lm_heads.{i}.weight"),
+                format!("talker.code_predictor.lm_head.{i}.weight"),
                 Tensor::zeros((CODEBOOK_SIZE, CP_HIDDEN), DType::F32, device).unwrap(),
+            );
+            store.insert_tensor(
+                format!("talker.code_predictor.model.codec_embedding.{i}.weight"),
+                Tensor::zeros((CODEBOOK_SIZE, HIDDEN), DType::F32, device).unwrap(),
             );
         }
 

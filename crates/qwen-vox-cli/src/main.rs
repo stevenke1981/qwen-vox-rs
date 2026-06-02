@@ -7,7 +7,10 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use qwen_vox_core::device::DeviceManager;
-use qwen_vox_core::{synthesize_formant_speech, FormantSynthConfig};
+use qwen_vox_core::pipeline::TtsPipeline;
+use qwen_vox_core::talker::Talker;
+use qwen_vox_core::tokenizer::Tokenizer;
+use qwen_vox_core::weights::WeightStore;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -22,6 +25,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Generate speech from text.
     Generate {
@@ -38,8 +42,15 @@ enum Commands {
         mode: String,
 
         /// Path to model weights (SafeTensors).
-        #[arg(long, default_value = "weights/model.safetensors")]
+        #[arg(long, default_value = "weights/converted/model.safetensors")]
         weights: PathBuf,
+
+        /// Path to speech tokenizer decoder weights (SafeTensors).
+        #[arg(
+            long,
+            default_value = "weights/alignments/tokenizer_decoder.safetensors"
+        )]
+        decoder_weights: PathBuf,
 
         /// Path to tokenizer.json.
         #[arg(long, default_value = "tokenizer.json")]
@@ -49,13 +60,13 @@ enum Commands {
         #[arg(long, default_value = "cpu")]
         device: String,
 
-        /// Base voice pitch in Hz.
-        #[arg(long, default_value_t = 145.0)]
-        pitch: f32,
+        /// Language control for Qwen3-TTS: auto, english, chinese, german, italian, or portuguese.
+        #[arg(long, default_value = "english")]
+        language: String,
 
-        /// Speech speed multiplier.
-        #[arg(long, default_value_t = 1.0)]
-        speed: f32,
+        /// Maximum codec frames to generate. 12 frames is about one second at 12 Hz.
+        #[arg(long, default_value_t = 48)]
+        max_frames: usize,
     },
 
     /// Show decoder information.
@@ -78,10 +89,11 @@ fn main() -> Result<()> {
             output,
             mode,
             weights,
+            decoder_weights,
             tokenizer,
             device,
-            pitch,
-            speed,
+            language,
+            max_frames,
         } => {
             // Parse and validate device early.
             let dev_mgr = DeviceManager::from_str(&device)
@@ -91,24 +103,28 @@ fn main() -> Result<()> {
             tracing::info!("Text: {text}");
             tracing::info!("Output: {}", output.display());
             tracing::info!("Weights: {}", weights.display());
+            tracing::info!("Decoder weights: {}", decoder_weights.display());
             tracing::info!("Tokenizer: {}", tokenizer.display());
-            tracing::info!("Pitch: {pitch} Hz, speed: {speed}");
+            tracing::info!("Language: {language}, max_frames={max_frames}");
 
-            let config = FormantSynthConfig {
-                sample_rate: 24_000,
-                base_pitch_hz: pitch,
-                speed,
-            };
-            let audio = synthesize_formant_speech(&text, &config);
-            write_wav(&output, config.sample_rate, &audio)
-                .with_context(|| format!("failed to write WAV to {}", output.display()))?;
+            generate_qwen3_tts(
+                &text,
+                &output,
+                &weights,
+                &decoder_weights,
+                &tokenizer,
+                dev_mgr.device(),
+                &language,
+                max_frames,
+            )
+            .with_context(|| {
+                format!(
+                    "failed to generate Qwen3-TTS speech at {}",
+                    output.display()
+                )
+            })?;
 
-            let duration = audio.len() as f32 / config.sample_rate as f32;
-            tracing::info!(
-                "Wrote {:.2}s of Rust-synthesized speech to {}",
-                duration,
-                output.display()
-            );
+            tracing::info!("Wrote speech to {}", output.display());
 
             Ok(())
         }
@@ -130,7 +146,6 @@ fn main() -> Result<()> {
             println!("Supported modes:");
             println!("  12hz  — Real-time interactive (Causal ConvNet + MTP)");
             println!("  25hz  — High-quality synthesis (Flow Matching DiT)");
-            println!("  fallback — Rust formant synthesizer used by the CLI generate command");
             println!();
             println!("Devices:");
             println!(
@@ -148,6 +163,88 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_qwen3_tts(
+    text: &str,
+    output: &PathBuf,
+    weights: &PathBuf,
+    decoder_weights: &PathBuf,
+    tokenizer_path: &PathBuf,
+    device: &candle_core::Device,
+    language: &str,
+    max_frames: usize,
+) -> Result<()> {
+    if text.trim().is_empty() {
+        anyhow::bail!("text must not be empty");
+    }
+
+    let tokenizer = Tokenizer::from_file(tokenizer_path)
+        .with_context(|| format!("failed to load tokenizer {}", tokenizer_path.display()))?;
+    let prompt = qwen3_prompt(text);
+    let prompt_tokens = tokenizer
+        .encode(&prompt)
+        .with_context(|| "failed to tokenize Qwen3-TTS ChatML prompt")?;
+
+    let talker_store = WeightStore::from_file(weights, device)
+        .with_context(|| format!("failed to load talker weights {}", weights.display()))?;
+    let talker = Talker::from_store(&talker_store).context("failed to build Qwen3-TTS talker")?;
+
+    let decoder_store = WeightStore::from_file(decoder_weights, device).with_context(|| {
+        format!(
+            "failed to load decoder weights {}",
+            decoder_weights.display()
+        )
+    })?;
+    let pipeline = TtsPipeline::from_tokenizer_weights(decoder_store)
+        .context("failed to build Qwen3-TTS codec decoder")?
+        .with_talker(talker);
+
+    let language_id = language_id(language)?;
+    let frames = pipeline
+        .talker()
+        .ok_or_else(|| anyhow::anyhow!("talker is not attached"))?
+        .generate_qwen3_base(&prompt_tokens, language_id, max_frames)
+        .context("Qwen3-TTS talker failed to generate codec frames")?;
+    if frames.is_empty() {
+        anyhow::bail!("Qwen3-TTS generated zero codec frames");
+    }
+
+    let waveform = pipeline
+        .decode_frame_codes(&frames)
+        .context("Qwen3-TTS codec decoder failed")?;
+    write_tensor_wav(output, 24_000, &waveform)?;
+    Ok(())
+}
+
+fn qwen3_prompt(text: &str) -> String {
+    format!("<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n")
+}
+
+fn language_id(language: &str) -> Result<Option<u32>> {
+    match language.to_ascii_lowercase().as_str() {
+        "auto" => Ok(None),
+        "english" | "en" => Ok(Some(2050)),
+        "chinese" | "zh" | "zh-tw" | "zh-cn" => Ok(Some(2055)),
+        "german" | "de" => Ok(Some(2053)),
+        "italian" | "it" => Ok(Some(2070)),
+        "portuguese" | "pt" => Ok(Some(2071)),
+        other => anyhow::bail!("unsupported Qwen3-TTS language: {other}"),
+    }
+}
+
+fn write_tensor_wav(
+    path: &PathBuf,
+    sample_rate: u32,
+    waveform: &candle_core::Tensor,
+) -> Result<()> {
+    let flat = waveform
+        .flatten_all()
+        .context("failed to flatten waveform tensor")?
+        .to_vec1::<f32>()
+        .context("failed to extract waveform samples")?;
+    write_wav(path, sample_rate, &flat)
 }
 
 fn write_wav(path: &PathBuf, sample_rate: u32, samples: &[f32]) -> Result<()> {

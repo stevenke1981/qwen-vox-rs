@@ -1201,6 +1201,7 @@ name = "qwen-vox-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "candle-core",
  "clap",
  "hound",
  "qwen-vox-core",

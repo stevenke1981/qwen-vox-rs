@@ -4,40 +4,51 @@ Rust workspace for Qwen-style speech generation experiments.
 
 This repository contains:
 
-- `qwen-vox-core`: Candle-based model building blocks, tokenizer/weight loading, codec decoder modules, and a Rust-only fallback speech synthesizer.
-- `qwen-vox-cli`: command-line WAV generation.
+- `qwen-vox-core`: Candle-based Qwen3-TTS tokenizer/weight loading, talker, codec decoder modules, and alignment tests.
+- `qwen-vox-cli`: command-line Qwen3-TTS WAV generation.
 
 The CLI is intentionally usable without Python, libtorch, ONNX Runtime, or PyTorch FFI.
 
 ## Quick Start
 
 ```powershell
-cargo run -p qwen-vox-cli -- generate `
-  --text "Hello from Rust speech synthesis" `
-  --output out/hello.wav
+cargo run -p qwen-vox-cli --features cuda -- generate `
+  --device cuda `
+  --text "Hello from Qwen three TTS." `
+  --output out/qwen3.wav `
+  --language english `
+  --max-frames 256
 ```
 
-Traditional Chinese text also works through the fallback synthesizer:
+Chinese text:
 
 ```powershell
-cargo run -p qwen-vox-cli -- generate `
-  --text "你好，這是 Rust 產生的人聲。" `
-  --output out/hello-zh.wav `
-  --pitch 170 `
-  --speed 0.95
+cargo run -p qwen-vox-cli --features cuda -- generate `
+  --device cuda `
+  --text "你好，這是 Qwen3 TTS 產生的語音。" `
+  --output out/qwen3-zh.wav `
+  --language chinese `
+  --max-frames 256
 ```
 
-The generated file is a 24 kHz, 16-bit mono WAV.
+The generated file is a 24 kHz, 16-bit mono WAV. One codec frame decodes to 64 samples, so audible output needs hundreds of frames.
 
 ## Current Generation Path
 
-`qwen-vox-cli generate` currently uses a pure Rust formant synthesizer so the project can produce audible, non-silent speech immediately. The Candle modules for tokenizer, talker, codec decoding, flow matching, and weight loading remain in `qwen-vox-core` for the neural Qwen3-TTS path.
+`qwen-vox-cli generate` now uses the local Qwen3-TTS model path:
+
+1. Tokenize a ChatML-style text prompt.
+2. Load `weights/converted/model.safetensors`.
+3. Build the Qwen3-TTS talker and generate 16-level codec frames.
+4. Load `weights/alignments/tokenizer_decoder.safetensors`.
+5. Decode codec frames to a 24 kHz WAV.
 
 This means:
 
-- Rust-only speech output works now.
+- The CLI no longer uses Windows SAPI or the Rust formant fallback for `generate`.
+- CUDA builds are strongly recommended.
 - Large model weights are not committed.
-- Full neural Qwen3-TTS inference still depends on completing model-specific wiring and validation.
+- The current generation path does not yet implement KV cache, so CPU generation is not practical and long CUDA generations are still slow.
 
 ## Model Files
 
@@ -55,6 +66,7 @@ The existing tests can use local files such as:
 cargo fmt
 cargo test
 cargo clippy --all-targets -- -D warnings
+cargo check -p qwen-vox-cli --features cuda
 ```
 
 ## Repository Layout
