@@ -1,0 +1,25 @@
+[package]
+name = "qwen-vox-cli"
+description = "Qwen3-TTS Rust CLI — generate speech from text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "qwen-vox"
+path = "src/main.rs"
+
+[features]
+default = []
+cuda = ["qwen-vox-core/cuda"]
+metal = ["qwen-vox-core/metal"]
+
+[dependencies]
+qwen-vox-core = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+hound = { workspace = true }
+tokio = { workspace = true }

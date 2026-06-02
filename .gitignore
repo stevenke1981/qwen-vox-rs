@@ -1,0 +1,30 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+.opencode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Weights & models
+*.safetensors
+*.pt
+*.bin
+models/
+weights/
+
+# Build artifacts
+*.wav
+*.pcm
+
+# Environment
+.env
+.env.local

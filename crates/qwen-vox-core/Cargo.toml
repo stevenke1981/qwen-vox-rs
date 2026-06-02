@@ -1,0 +1,28 @@
+[package]
+name = "qwen-vox-core"
+description = "Qwen3-TTS codec decoder core — Candle-based, PyTorch-free"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+rayon = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+safetensors = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+hound = { workspace = true }
+half = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal"]
