@@ -114,6 +114,40 @@ pub struct GroupedQueryAttention {
     head_dim: usize,
 }
 
+/// Per-layer K/V cache for autoregressive decoding.
+#[derive(Debug, Clone, Default)]
+pub struct AttentionCache {
+    key: Option<Tensor>,
+    value: Option<Tensor>,
+}
+
+impl AttentionCache {
+    /// Number of cached key/value positions.
+    pub fn seq_len(&self) -> Result<usize> {
+        match &self.key {
+            Some(key) => key.dim(2),
+            None => Ok(0),
+        }
+    }
+
+    fn append(&mut self, key: Tensor, value: Tensor) -> Result<(Tensor, Tensor)> {
+        let key = if let Some(prev) = &self.key {
+            Tensor::cat(&[prev, &key], 2)?
+        } else {
+            key
+        };
+        let value = if let Some(prev) = &self.value {
+            Tensor::cat(&[prev, &value], 2)?
+        } else {
+            value
+        };
+
+        self.key = Some(key.clone());
+        self.value = Some(value.clone());
+        Ok((key, value))
+    }
+}
+
 impl GroupedQueryAttention {
     /// Construct from pre-loaded projection weights and optional Q/K norms.
     #[allow(clippy::too_many_arguments)]
@@ -200,6 +234,19 @@ impl GroupedQueryAttention {
     ///
     /// Expects `x` of shape [batch, seq_len, hidden].
     pub fn forward(&self, x: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
+        self.forward_with_cache(x, mask, None)
+    }
+
+    /// Forward pass that appends projected K/V tensors into an autoregressive cache.
+    ///
+    /// The query length is the input length, while cached keys/values may be longer.
+    /// This supports a full prompt prefill followed by one-token incremental steps.
+    pub fn forward_with_cache(
+        &self,
+        x: &Tensor,
+        mask: Option<&Tensor>,
+        cache: Option<&mut AttentionCache>,
+    ) -> Result<Tensor> {
         let (b, s, _hidden) = x.dims3()?;
 
         // Linear projections (use broadcast_matmul for 3D x @ 2D weight)
@@ -233,6 +280,12 @@ impl GroupedQueryAttention {
             candle_nn::ops::rms_norm(&k, kn, 1e-5)?
         } else {
             k
+        };
+
+        let (k, v) = if let Some(cache) = cache {
+            cache.append(k, v)?
+        } else {
+            (k, v)
         };
 
         // Core GQA (handles KV head repetition internally)
@@ -309,9 +362,19 @@ impl TransformerBlock {
     /// `h = x + layer_scale( attn( ln1(x) ), attn_gamma )`  (if gamma present)
     /// `h = h + layer_scale( mlp( ln2(h) ), mlp_gamma )`     (if gamma present)
     pub fn forward(&self, x: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
+        self.forward_with_cache(x, mask, None)
+    }
+
+    /// Pre-norm block forward with optional attention KV cache.
+    pub fn forward_with_cache(
+        &self,
+        x: &Tensor,
+        mask: Option<&Tensor>,
+        cache: Option<&mut AttentionCache>,
+    ) -> Result<Tensor> {
         // Attention sub-layer (pre-norm + residual + optional scale)
         let h = self.ln1.forward(x)?;
-        let attn_out = self.attn.forward(&h, mask)?;
+        let attn_out = self.attn.forward_with_cache(&h, mask, cache)?;
         let attn_out = if let Some(ref gamma) = self.attn_layer_scale {
             layer_scale_3d(&attn_out, gamma, 2)?
         } else {
@@ -338,6 +401,24 @@ pub struct TransformerStack {
     norm: Option<RmsNorm>,
     input_proj: Option<(Tensor, Option<Tensor>)>, // (weight, bias)
     output_proj: Option<(Tensor, Option<Tensor>)>,
+}
+
+/// K/V cache for every attention layer in a [`TransformerStack`].
+#[derive(Debug, Clone)]
+pub struct TransformerCache {
+    layers: Vec<AttentionCache>,
+}
+
+impl TransformerCache {
+    pub fn new(num_layers: usize) -> Self {
+        Self {
+            layers: vec![AttentionCache::default(); num_layers],
+        }
+    }
+
+    pub fn layer_seq_len(&self, layer: usize) -> Result<usize> {
+        self.layers[layer].seq_len()
+    }
 }
 
 impl TransformerStack {
@@ -375,6 +456,44 @@ impl TransformerStack {
             h = block.forward(&h, mask)?;
         }
 
+        self.forward_tail(h)
+    }
+
+    /// Create an empty autoregressive K/V cache matching this stack's layers.
+    pub fn empty_cache(&self) -> TransformerCache {
+        TransformerCache::new(self.blocks.len())
+    }
+
+    /// Forward through the stack while appending K/V tensors to `cache`.
+    ///
+    /// Call once with the full prompt to prefill, then repeatedly with `[B, 1, D]`
+    /// tensors for incremental generation.
+    pub fn forward_with_cache(
+        &self,
+        x: &Tensor,
+        mask: Option<&Tensor>,
+        cache: &mut TransformerCache,
+    ) -> Result<Tensor> {
+        debug_assert_eq!(self.blocks.len(), cache.layers.len());
+        let mut h = x.clone();
+
+        // Optional input projection (e.g. 1024 -> 512 for pre_transformer)
+        if let Some((ref w, ref bias)) = self.input_proj {
+            h = h.broadcast_matmul(&w.t()?)?;
+            if let Some(ref b) = bias {
+                h = h.broadcast_add(b)?;
+            }
+        }
+
+        // Transformer blocks
+        for (block, layer_cache) in self.blocks.iter().zip(cache.layers.iter_mut()) {
+            h = block.forward_with_cache(&h, mask, Some(layer_cache))?;
+        }
+
+        self.forward_tail(h)
+    }
+
+    fn forward_tail(&self, mut h: Tensor) -> Result<Tensor> {
         // Optional final norm
         if let Some(ref n) = self.norm {
             h = n.forward(&h)?;
@@ -472,6 +591,18 @@ mod tests {
         let mask = crate::custom_ops::causal_mask(seq, &device).unwrap();
         let y2 = gqa.forward(&x, Some(&mask)).unwrap();
         assert_eq!(y2.dims(), &[batch, seq, hidden]);
+
+        let mut cache = AttentionCache::default();
+        let y3 = gqa.forward_with_cache(&x, None, Some(&mut cache)).unwrap();
+        assert_eq!(y3.dims(), &[batch, seq, hidden]);
+        assert_eq!(cache.seq_len().unwrap(), seq);
+
+        let next = Tensor::randn(0f32, 1.0, (batch, 1, hidden), &device).unwrap();
+        let y4 = gqa
+            .forward_with_cache(&next, None, Some(&mut cache))
+            .unwrap();
+        assert_eq!(y4.dims(), &[batch, 1, hidden]);
+        assert_eq!(cache.seq_len().unwrap(), seq + 1);
     }
 
     #[test]
@@ -582,6 +713,16 @@ mod tests {
         let x = Tensor::randn(0f32, 0.5, (batch, seq, in_dim), &device).unwrap();
         let y = stack.forward(&x, None).unwrap();
         assert_eq!(y.dims(), &[batch, seq, out_dim]);
+
+        let mut cache = stack.empty_cache();
+        let y_prefill = stack.forward_with_cache(&x, None, &mut cache).unwrap();
+        assert_eq!(y_prefill.dims(), &[batch, seq, out_dim]);
+        assert_eq!(cache.layer_seq_len(0).unwrap(), seq);
+
+        let next = Tensor::randn(0f32, 0.5, (batch, 1, in_dim), &device).unwrap();
+        let y_next = stack.forward_with_cache(&next, None, &mut cache).unwrap();
+        assert_eq!(y_next.dims(), &[batch, 1, out_dim]);
+        assert_eq!(cache.layer_seq_len(0).unwrap(), seq + 1);
     }
 
     #[test]

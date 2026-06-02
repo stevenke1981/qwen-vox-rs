@@ -27,8 +27,9 @@
 //! Autoregressive loop: text → backbone → predict 16 codes → append q0
 //! embedding → repeat until EOS or max frames.
 
+use crate::custom_ops::causal_mask;
 use crate::error::{VoxError, VoxResult};
-use crate::transformer::{RmsNorm, TransformerBlock, TransformerStack};
+use crate::transformer::{RmsNorm, TransformerBlock, TransformerCache, TransformerStack};
 use crate::weights::WeightStore;
 use candle_core::{Device, Tensor};
 
@@ -287,6 +288,16 @@ impl Talker {
         self.final_norm.forward(&h)
     }
 
+    fn backbone_forward_cached(
+        &self,
+        x: &Tensor,
+        cache: &mut TransformerCache,
+        mask: Option<&Tensor>,
+    ) -> candle_core::Result<Tensor> {
+        let h = self.backbone.forward_with_cache(x, mask, cache)?;
+        self.final_norm.forward(&h)
+    }
+
     // ── Code Prediction ────────────────────────────────────────────────────────
 
     /// Predict one frame of 16 codes (q0..q15) from a backbone hidden state.
@@ -429,7 +440,7 @@ impl Talker {
             .encode_text(&input_tokens[3..4])?
             .add(&codec_embed.narrow(1, codec_len - 1, 1)?)?;
 
-        let mut input_hidden = Tensor::cat(&[&role_embed, &prefill_embed, &first_text], 1)?;
+        let input_hidden = Tensor::cat(&[&role_embed, &prefill_embed, &first_text], 1)?;
 
         let mut trailing_parts = Vec::new();
         if input_tokens.len() > 9 {
@@ -439,11 +450,14 @@ impl Talker {
         let trailing_refs: Vec<&Tensor> = trailing_parts.iter().collect();
         let trailing_text_hidden = Tensor::cat(&trailing_refs, 1)?;
 
+        let mut cache = self.backbone.empty_cache();
+        let prefill_mask = causal_mask(input_hidden.dim(1)?, input_hidden.device())?;
+        let mut hidden = self
+            .backbone_forward_cached(&input_hidden, &mut cache, Some(&prefill_mask))
+            .map_err(|e| VoxError::Inference(format!("backbone prefill: {e}")))?;
+
         let mut frames = Vec::with_capacity(max_frames.min(512));
         for step in 0..max_frames {
-            let hidden = self
-                .backbone_forward(&input_hidden)
-                .map_err(|e| VoxError::Inference(format!("backbone forward: {e}")))?;
             let (q0, residual_codes) = self.predict_codes(&hidden)?;
 
             let mut frame = [0u16; 16];
@@ -464,8 +478,9 @@ impl Talker {
                 tts_pad_embed.clone()
             };
             next_embed = next_embed.add(&text_add)?;
-            input_hidden = Tensor::cat(&[&input_hidden, &next_embed], 1)
-                .map_err(|e| VoxError::Inference(format!("cat generated embed: {e}")))?;
+            hidden = self
+                .backbone_forward_cached(&next_embed, &mut cache, None)
+                .map_err(|e| VoxError::Inference(format!("backbone incremental: {e}")))?;
         }
 
         Ok(frames)
