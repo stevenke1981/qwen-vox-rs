@@ -69,6 +69,13 @@ Latest validation:
   - Added `qwen-vox clone` CLI scaffolding with Base-model validation and clear
     errors. Next step is implementing the Base speaker encoder and dynamic
     0.6B talker loading.
+- Minnan / Taiwan Taigi feature reference:
+  - Added `docs/qwen3_tts_minnan_hokkien_guide.md` with Qwen3-TTS Voice Design,
+    CustomVoice, and Voice Clone usage targets for Minnan / Hokkien / Taiwan
+    Taigi.
+  - Included CosyVoice 3 Minnan examples as comparison/reference only; it is
+    not an implemented backend in this Rust repository.
+  - Linked the guide from `README.md`.
 - `python tools\generate_official_reference.py --help` succeeds.
 - `cargo check -p qwen-vox-cli --features cuda` succeeds without warnings.
 - Rust CLI can now dump generated codec frames before decode via

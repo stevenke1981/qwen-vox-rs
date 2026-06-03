@@ -34,6 +34,12 @@ cargo run -p qwen-vox-cli --features cuda -- generate `
 
 The generated file is a 24 kHz, 16-bit mono WAV. The 12 Hz tokenizer runs at 12.5 codec frames per second; each codec frame decodes to 1,920 samples. By default `--max-frames 0` auto-estimates a frame cap from text length. Pass an explicit `--max-frames N` to override it.
 
+Dialect and Taiwan Taigi / Minnan usage notes are documented in
+[`docs/qwen3_tts_minnan_hokkien_guide.md`](docs/qwen3_tts_minnan_hokkien_guide.md).
+The Rust CLI currently supports CustomVoice preset generation; Base voice clone
+and Voice Design / instruct control are tracked as follow-up implementation
+work.
+
 ## Release Builds
 
 Build both local Windows release binaries:
