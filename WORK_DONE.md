@@ -45,6 +45,13 @@ Latest validation:
   - Rust q0 head: `[968, 968, 968, 968, 968, 968, 968, 968]`
   - Conclusion: after token parity, the next failure is in talker prompt
     embedding / position-cache / q0 logits, not the waveform decoder.
+- First q0 logits top-k probe:
+  - Official: argmax `1995`, top logit `32.25`.
+  - Rust before RoPE fix: argmax `968`, top logit about `7.72`.
+  - Rust after changing RoPE from adjacent-pair rotation to official
+    half-split `rotate_half`: argmax `841`, top logit `10.0`.
+  - Conclusion: official half-split RoPE is required and fixed, but another
+    backbone mismatch remains before q0 parity is reached.
 
 ## Completed In This Stage
 
@@ -88,6 +95,12 @@ Latest validation:
   - Adds `--dump-codec-frames` and defaults tokenizer loading to `weights/hf_original`.
 - `crates/qwen-vox-core/src/tokenizer.rs`
   - Loads official HF tokenizer directories, merges added special tokens, and preserves ChatML special tokens before BPE.
+- `crates/qwen-vox-core/src/transformer.rs`
+  - Talker RoPE now uses official half-split `rotate_half` semantics instead
+    of adjacent even/odd pairing.
+- `crates/qwen-vox-core/src/talker.rs`
+  - Adds optional first-frame q0 logits top-k dump through
+    `QWEN_VOX_DUMP_Q0_TOPK`.
 - `OFFICIAL_QWEN3_TTS_REFERENCE_FLOW.md`
   - Complete official flow record and Rust rewrite target order.
 - `plan.md`
@@ -119,4 +132,6 @@ python tools\generate_official_reference.py --text "你好，這是官方 Qwen3 
 cargo run -p qwen-vox-cli --features cuda --bin qwen-vox -- generate --device cuda --language chinese --speaker vivian --text "你好，這是官方 Qwen3 TTS 參考語音。" --max-frames 16 --temperature 0 --dump-codec-frames out\rust_official_prompt_argmax16_frames.json --output out\rust_official_prompt_argmax16.wav
 python tools\generate_official_reference.py --text "你好，這是官方 Qwen3 TTS 參考語音。" --language chinese --speaker vivian --max-new-tokens 16 --argmax --output out\official_qwen3_reference_argmax16.wav --codes-output out\official_qwen3_reference_argmax16_codes.npy
 python tools\compare_codec_frames.py --official out\official_qwen3_reference_argmax16_codes.npy --rust out\rust_official_prompt_argmax16_frames.json --show 8
+cargo run -p qwen-vox-cli --features cuda --bin qwen-vox -- generate --device cuda --language chinese --speaker vivian --text "你好，這是官方 Qwen3 TTS 參考語音。" --max-frames 1 --temperature 0 --dump-q0-topk out\rust_q0_topk.json --dump-codec-frames out\rust_q0_probe_frames.json --output out\rust_q0_probe.wav
+python tools\generate_official_reference.py --text "你好，這是官方 Qwen3 TTS 參考語音。" --language chinese --speaker vivian --max-new-tokens 2 --argmax --output out\official_q0_probe.wav --codes-output out\official_q0_probe_codes.npy --q0-topk-output out\official_q0_topk.json
 ```

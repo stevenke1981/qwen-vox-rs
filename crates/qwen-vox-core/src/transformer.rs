@@ -329,12 +329,13 @@ impl GroupedQueryAttention {
     }
 }
 
-/// Apply interleaved RoPE to a `[batch, heads, seq, head_dim]` tensor.
+/// Apply Qwen/HF half-split RoPE to a `[batch, heads, seq, head_dim]` tensor.
 ///
-/// Qwen3-TTS stores RoPE pairs as adjacent even/odd channels. Cached decoding
-/// rotates only the new positions, using the prior cache length as offset.
+/// Official Qwen3-TTS uses `rotate_half(x) = cat(-x[..., half:], x[..., :half])`,
+/// not adjacent even/odd pairing. Cached decoding rotates only the new
+/// positions, using the prior cache length as offset.
 fn apply_rotary_embedding(x: &Tensor, position_offset: usize, theta: f64) -> Result<Tensor> {
-    let (b, h, s, d) = x.dims4()?;
+    let (_b, _h, s, d) = x.dims4()?;
     if d % 2 != 0 {
         return Err(Error::Msg(format!("RoPE head_dim must be even, got {d}")));
     }
@@ -362,20 +363,18 @@ fn apply_rotary_embedding(x: &Tensor, position_offset: usize, theta: f64) -> Res
     let cos = Tensor::from_vec(cos, (s, half), device)?.reshape((1, 1, s, half))?;
     let sin = Tensor::from_vec(sin, (s, half), device)?.reshape((1, 1, s, half))?;
 
-    let x_pairs = x_work.reshape((b, h, s, half, 2))?;
-    let x_even = x_pairs.narrow(4, 0, 1)?.squeeze(4)?;
-    let x_odd = x_pairs.narrow(4, 1, 1)?.squeeze(4)?;
+    let x1 = x_work.narrow(3, 0, half)?;
+    let x2 = x_work.narrow(3, half, half)?;
 
-    let even_cos = x_even.broadcast_mul(&cos)?;
-    let odd_sin = x_odd.broadcast_mul(&sin)?;
-    let out_even = even_cos.broadcast_sub(&odd_sin)?;
+    let x1_cos = x1.broadcast_mul(&cos)?;
+    let x2_sin = x2.broadcast_mul(&sin)?;
+    let out_first = x1_cos.broadcast_sub(&x2_sin)?;
 
-    let even_sin = x_even.broadcast_mul(&sin)?;
-    let odd_cos = x_odd.broadcast_mul(&cos)?;
-    let out_odd = even_sin.broadcast_add(&odd_cos)?;
+    let x2_cos = x2.broadcast_mul(&cos)?;
+    let x1_sin = x1.broadcast_mul(&sin)?;
+    let out_second = x2_cos.broadcast_add(&x1_sin)?;
 
-    let out = Tensor::cat(&[&out_even.unsqueeze(4)?, &out_odd.unsqueeze(4)?], 4)?
-        .reshape((b, h, s, d))?;
+    let out = Tensor::cat(&[&out_first, &out_second], 3)?;
 
     if original_dtype == DType::F32 {
         Ok(out)

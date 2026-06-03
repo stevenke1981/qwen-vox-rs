@@ -33,6 +33,7 @@ use crate::sampling::{sample_token, SamplingConfig};
 use crate::transformer::{RmsNorm, TransformerBlock, TransformerCache, TransformerStack};
 use crate::weights::WeightStore;
 use candle_core::{Device, Tensor};
+use std::io::Write;
 
 // ── Architecture Constants ──────────────────────────────────────────────────────
 
@@ -336,6 +337,9 @@ impl Talker {
                                                                 // Convert to F32 (candle matmul on CUDA may keep BF16); sampling needs f32 slice.
         let q0_logits_f32 = q0_logits.squeeze(0)?.to_dtype(candle_core::DType::F32)?;
         let q0_logits_vec = q0_logits_f32.to_vec1::<f32>()?;
+        if q0_history.is_empty() {
+            dump_q0_topk_from_env(&q0_logits_vec)?;
+        }
         let q0_idx = sample_token(&q0_logits_vec, config, q0_history);
 
         // ── q1..q15 via code predictor (autoregressive) ──
@@ -734,6 +738,50 @@ impl Talker {
         }
         Ok(())
     }
+}
+
+fn dump_q0_topk_from_env(logits: &[f32]) -> VoxResult<()> {
+    let Some(path) = std::env::var_os("QWEN_VOX_DUMP_Q0_TOPK") else {
+        return Ok(());
+    };
+    let path = std::path::PathBuf::from(path);
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| VoxError::Inference(format!("create {}: {e}", parent.display())))?;
+    }
+
+    let mut pairs: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+    pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Less));
+    let top = pairs.into_iter().take(16).collect::<Vec<_>>();
+
+    let file = std::fs::File::create(&path)
+        .map_err(|e| VoxError::Inference(format!("create {}: {e}", path.display())))?;
+    let mut writer = std::io::BufWriter::new(file);
+    writeln!(writer, "{{").map_err(io_error)?;
+    writeln!(writer, "  \"format\": \"qwen-vox-q0-topk-v1\",").map_err(io_error)?;
+    writeln!(
+        writer,
+        "  \"argmax\": {},",
+        top.first().map(|p| p.0).unwrap_or(0)
+    )
+    .map_err(io_error)?;
+    writeln!(writer, "  \"top\": [").map_err(io_error)?;
+    for (i, (token, logit)) in top.iter().enumerate() {
+        let comma = if i + 1 == top.len() { "" } else { "," };
+        writeln!(
+            writer,
+            "    {{\"id\": {}, \"logit\": {:.9}}}{}",
+            token, logit, comma
+        )
+        .map_err(io_error)?;
+    }
+    writeln!(writer, "  ]").map_err(io_error)?;
+    writeln!(writer, "}}").map_err(io_error)?;
+    Ok(())
+}
+
+fn io_error(e: std::io::Error) -> VoxError {
+    VoxError::Inference(format!("write q0 top-k dump: {e}"))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────

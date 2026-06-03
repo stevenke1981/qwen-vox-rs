@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import inspect
+import json
 import math
 import pathlib
 import sys
@@ -149,6 +151,7 @@ def main() -> int:
     parser.add_argument("--source-dir", default="out")
     parser.add_argument("--output", default="out/official_qwen3_reference.wav")
     parser.add_argument("--codes-output", default="")
+    parser.add_argument("--q0-topk-output", default="")
     parser.add_argument("--argmax", action="store_true")
     parser.add_argument("--cpu", action="store_true")
     args = parser.parse_args()
@@ -179,6 +182,41 @@ def main() -> int:
     model.eval()
     if device == "cuda":
         model.to(device)
+
+    if args.q0_topk_output:
+        topk_path = pathlib.Path(args.q0_topk_output).resolve()
+        topk_path.parent.mkdir(parents=True, exist_ok=True)
+        original_talker_forward = model.talker.forward
+        dumped = {"done": False}
+
+        def wrapped_talker_forward(*forward_args, **forward_kwargs):
+            output = original_talker_forward(*forward_args, **forward_kwargs)
+            inputs_embeds = forward_kwargs.get("inputs_embeds")
+            if (
+                not dumped["done"]
+                and inputs_embeds is not None
+                and inputs_embeds.shape[1] > 1
+            ):
+                logits = output.logits[0, -1, :2048].detach().float().cpu()
+                values, indices = torch.topk(logits, k=min(16, logits.numel()))
+                payload = {
+                    "format": "official-qwen3-tts-q0-topk-v1",
+                    "argmax": int(indices[0]),
+                    "top": [
+                        {"id": int(i), "logit": float(v)}
+                        for i, v in zip(indices.tolist(), values.tolist())
+                    ],
+                }
+                topk_path.write_text(
+                    json.dumps(payload, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                dumped["done"] = True
+                print({"q0_topk_output": str(topk_path)})
+            return output
+
+        wrapped_talker_forward.__signature__ = inspect.signature(original_talker_forward)
+        model.talker.forward = wrapped_talker_forward
 
     tokenizer = AutoTokenizer.from_pretrained(str(weights_dir), local_files_only=True)
     processor = processing.Qwen3TTSProcessor(tokenizer=tokenizer)

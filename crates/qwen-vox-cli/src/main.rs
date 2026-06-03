@@ -84,6 +84,10 @@ enum Commands {
         #[arg(long)]
         dump_codec_frames: Option<PathBuf>,
 
+        /// Write first-frame q0 logits top-k diagnostics to a JSON file.
+        #[arg(long)]
+        dump_q0_topk: Option<PathBuf>,
+
         /// Sampling temperature (lower = more deterministic). Use 0 for argmax.
         #[arg(long, default_value_t = 0.9)]
         temperature: f32,
@@ -134,6 +138,7 @@ fn main() -> Result<()> {
             max_frames,
             debug_frames,
             dump_codec_frames,
+            dump_q0_topk,
             temperature,
             top_k,
             top_p,
@@ -184,6 +189,10 @@ fn main() -> Result<()> {
                     .map(|t| t.to_string())
                     .unwrap_or_else(|| "auto".into())
             );
+
+            if let Some(path) = &dump_q0_topk {
+                std::env::set_var("QWEN_VOX_DUMP_Q0_TOPK", path);
+            }
 
             generate_qwen3_tts(
                 &text,
