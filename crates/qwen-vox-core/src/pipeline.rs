@@ -35,6 +35,7 @@ use candle_core::{Device, Module, Result, Tensor};
 // ── Constants ──────────────────────────────────────────────────────────────────
 
 const PRE_TRANSFORMER_EPS: f64 = 1e-5;
+const PRE_TRANSFORMER_ROPE_THETA: f64 = 10_000.0;
 const PRE_TRANSFORMER_HEADS: usize = 8;
 const PRE_TRANSFORMER_KV_HEADS: usize = 8;
 const PRE_TRANSFORMER_LAYERS: usize = 8;
@@ -373,7 +374,8 @@ impl CodecDecoder {
                 PRE_TRANSFORMER_HEADS,
                 PRE_TRANSFORMER_KV_HEADS,
                 PRE_TRANSFORMER_EPS,
-            )?;
+            )?
+            .with_rope_theta(PRE_TRANSFORMER_ROPE_THETA);
             blocks.push(block);
         }
 

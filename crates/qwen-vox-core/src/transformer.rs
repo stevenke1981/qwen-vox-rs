@@ -13,10 +13,7 @@
 //!
 //! Custom ops (layer_scale, grouped_query_attention) are imported from crate::custom_ops.
 
-use candle_core::{Result, Tensor};
-
-#[cfg(test)]
-use candle_core::DType;
+use candle_core::{DType, Error, Result, Tensor};
 
 use crate::custom_ops::{grouped_query_attention, layer_scale_3d};
 use crate::error::{VoxError, VoxResult};
@@ -112,6 +109,8 @@ pub struct GroupedQueryAttention {
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
+    norm_eps: f64,
+    rope_theta: Option<f64>,
 }
 
 /// Per-layer K/V cache for autoregressive decoding.
@@ -227,7 +226,21 @@ impl GroupedQueryAttention {
             num_heads,
             num_kv_heads,
             head_dim,
+            norm_eps: 1e-5,
+            rope_theta: None,
         })
+    }
+
+    /// Set the epsilon used by optional per-head Q/K RMSNorm.
+    pub fn with_norm_eps(mut self, eps: f64) -> Self {
+        self.norm_eps = eps;
+        self
+    }
+
+    /// Enable interleaved rotary position embeddings for Q/K.
+    pub fn with_rope_theta(mut self, theta: f64) -> Self {
+        self.rope_theta = Some(theta);
+        self
     }
 
     /// Forward pass with optional attention mask (shape [seq_len, seq_len]).
@@ -245,7 +258,7 @@ impl GroupedQueryAttention {
         &self,
         x: &Tensor,
         mask: Option<&Tensor>,
-        cache: Option<&mut AttentionCache>,
+        mut cache: Option<&mut AttentionCache>,
     ) -> Result<Tensor> {
         let (b, s, _hidden) = x.dims3()?;
 
@@ -272,17 +285,32 @@ impl GroupedQueryAttention {
 
         // Optional per-head Q/K RMSNorm (weight shape [head_dim], broadcasts over b/nh/s)
         let q = if let Some(ref qn) = self.q_norm {
-            candle_nn::ops::rms_norm(&q, qn, 1e-5)?
+            candle_nn::ops::rms_norm(&q, qn, self.norm_eps as f32)?
         } else {
             q
         };
         let k = if let Some(ref kn) = self.k_norm {
-            candle_nn::ops::rms_norm(&k, kn, 1e-5)?
+            candle_nn::ops::rms_norm(&k, kn, self.norm_eps as f32)?
         } else {
             k
         };
 
-        let (k, v) = if let Some(cache) = cache {
+        let position_offset = if let Some(ref cache) = cache {
+            cache.seq_len()?
+        } else {
+            0
+        };
+
+        let (q, k) = if let Some(theta) = self.rope_theta {
+            (
+                apply_rotary_embedding(&q, position_offset, theta)?,
+                apply_rotary_embedding(&k, position_offset, theta)?,
+            )
+        } else {
+            (q, k)
+        };
+
+        let (k, v) = if let Some(cache) = cache.take() {
             cache.append(k, v)?
         } else {
             (k, v)
@@ -298,6 +326,61 @@ impl GroupedQueryAttention {
 
         // Output projection
         attn.broadcast_matmul(&self.o_proj.t()?)
+    }
+}
+
+/// Apply interleaved RoPE to a `[batch, heads, seq, head_dim]` tensor.
+///
+/// Qwen3-TTS stores RoPE pairs as adjacent even/odd channels. Cached decoding
+/// rotates only the new positions, using the prior cache length as offset.
+fn apply_rotary_embedding(x: &Tensor, position_offset: usize, theta: f64) -> Result<Tensor> {
+    let (b, h, s, d) = x.dims4()?;
+    if d % 2 != 0 {
+        return Err(Error::Msg(format!("RoPE head_dim must be even, got {d}")));
+    }
+
+    let half = d / 2;
+    let device = x.device();
+    let original_dtype = x.dtype();
+    let x_work = if original_dtype == DType::F32 {
+        x.clone()
+    } else {
+        x.to_dtype(DType::F32)?
+    };
+
+    let mut cos = Vec::with_capacity(s * half);
+    let mut sin = Vec::with_capacity(s * half);
+    for pos in position_offset..position_offset + s {
+        for i in 0..half {
+            let inv_freq = theta.powf(-(2.0 * i as f64) / d as f64);
+            let angle = pos as f64 * inv_freq;
+            cos.push(angle.cos() as f32);
+            sin.push(angle.sin() as f32);
+        }
+    }
+
+    let cos = Tensor::from_vec(cos, (s, half), device)?.reshape((1, 1, s, half))?;
+    let sin = Tensor::from_vec(sin, (s, half), device)?.reshape((1, 1, s, half))?;
+
+    let x_pairs = x_work.reshape((b, h, s, half, 2))?;
+    let x_even = x_pairs.narrow(4, 0, 1)?.squeeze(4)?;
+    let x_odd = x_pairs.narrow(4, 1, 1)?.squeeze(4)?;
+
+    let even_cos = x_even.broadcast_mul(&cos)?;
+    let odd_sin = x_odd.broadcast_mul(&sin)?;
+    let out_even = even_cos.broadcast_sub(&odd_sin)?;
+
+    let even_sin = x_even.broadcast_mul(&sin)?;
+    let odd_cos = x_odd.broadcast_mul(&cos)?;
+    let out_odd = even_sin.broadcast_add(&odd_cos)?;
+
+    let out = Tensor::cat(&[&out_even.unsqueeze(4)?, &out_odd.unsqueeze(4)?], 4)?
+        .reshape((b, h, s, d))?;
+
+    if original_dtype == DType::F32 {
+        Ok(out)
+    } else {
+        out.to_dtype(original_dtype)
     }
 }
 
@@ -342,7 +425,8 @@ impl TransformerBlock {
             k_norm,
             num_heads,
             num_kv_heads,
-        )?;
+        )?
+        .with_norm_eps(eps);
         let mlp = SwiGLU::from_weights(gate_proj, up_proj, down_proj)?;
         let ln1 = RmsNorm::from_weight(input_layernorm_weight, eps);
         let ln2 = RmsNorm::from_weight(post_attention_layernorm_weight, eps);
@@ -355,6 +439,12 @@ impl TransformerBlock {
             attn_layer_scale,
             mlp_layer_scale,
         })
+    }
+
+    /// Enable interleaved RoPE for this block's self-attention.
+    pub fn with_rope_theta(mut self, theta: f64) -> Self {
+        self.attn = self.attn.with_rope_theta(theta);
+        self
     }
 
     /// Pre-norm block forward.
@@ -602,6 +692,79 @@ mod tests {
             .forward_with_cache(&next, None, Some(&mut cache))
             .unwrap();
         assert_eq!(y4.dims(), &[batch, 1, hidden]);
+        assert_eq!(cache.seq_len().unwrap(), seq + 1);
+    }
+
+    #[test]
+    fn test_rotary_embedding_shape_and_position_offset() {
+        let device = cpu();
+        let x = Tensor::from_vec(
+            vec![1.0f32, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0],
+            (1, 1, 2, 4),
+            &device,
+        )
+        .unwrap();
+
+        let y = apply_rotary_embedding(&x, 0, 10_000.0).unwrap();
+        assert_eq!(y.dims(), &[1, 1, 2, 4]);
+
+        let first = y
+            .narrow(2, 0, 1)
+            .unwrap()
+            .squeeze(2)
+            .unwrap()
+            .to_vec3::<f32>()
+            .unwrap();
+        assert!((first[0][0][0] - 1.0).abs() < 1e-6);
+        assert!(first[0][0][1].abs() < 1e-6);
+        assert!(first[0][0][2].abs() < 1e-6);
+        assert!((first[0][0][3] - 1.0).abs() < 1e-6);
+
+        let shifted = apply_rotary_embedding(&x, 1, 10_000.0).unwrap();
+        let diff = shifted.broadcast_sub(&y).unwrap();
+        let total_delta = diff
+            .abs()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(total_delta > 0.01);
+    }
+
+    #[test]
+    fn test_grouped_query_attention_with_rope_cache() {
+        let device = cpu();
+        let batch = 1usize;
+        let seq = 3usize;
+        let hidden = 8usize;
+        let num_heads = 2usize;
+        let head_dim = 4usize;
+        let q_dim = num_heads * head_dim;
+        let num_kv_heads = 1usize;
+        let kv_dim = num_kv_heads * head_dim;
+
+        let q = Tensor::randn(0f32, 0.1, (q_dim, hidden), &device).unwrap();
+        let k = Tensor::randn(0f32, 0.1, (kv_dim, hidden), &device).unwrap();
+        let v = Tensor::randn(0f32, 0.1, (kv_dim, hidden), &device).unwrap();
+        let o = Tensor::randn(0f32, 0.1, (hidden, q_dim), &device).unwrap();
+
+        let gqa =
+            GroupedQueryAttention::from_weights(q, k, v, o, None, None, num_heads, num_kv_heads)
+                .unwrap()
+                .with_rope_theta(10_000.0);
+
+        let x = Tensor::randn(0f32, 1.0, (batch, seq, hidden), &device).unwrap();
+        let mut cache = AttentionCache::default();
+        let y = gqa.forward_with_cache(&x, None, Some(&mut cache)).unwrap();
+        assert_eq!(y.dims(), &[batch, seq, hidden]);
+        assert_eq!(cache.seq_len().unwrap(), seq);
+
+        let next = Tensor::randn(0f32, 1.0, (batch, 1, hidden), &device).unwrap();
+        let y_next = gqa
+            .forward_with_cache(&next, None, Some(&mut cache))
+            .unwrap();
+        assert_eq!(y_next.dims(), &[batch, 1, hidden]);
         assert_eq!(cache.seq_len().unwrap(), seq + 1);
     }
 

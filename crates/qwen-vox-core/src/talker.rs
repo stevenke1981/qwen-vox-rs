@@ -46,7 +46,8 @@ const NUM_KV_HEADS: usize = 8;
 const NUM_BACKBONE_LAYERS: usize = 28;
 const NUM_CP_LAYERS: usize = 5;
 const NUM_RESIDUAL_CODES: usize = 15;
-const EPS: f64 = 1e-5;
+const EPS: f64 = 1e-6;
+const TALKER_ROPE_THETA: f64 = 1_000_000.0;
 
 #[allow(dead_code)]
 const HEAD_DIM: usize = 128;
@@ -617,7 +618,7 @@ impl Talker {
             .get(&format!("{prefix}.mlp_layer_scale.scale"))
             .cloned();
 
-        TransformerBlock::from_weights(
+        Ok(TransformerBlock::from_weights(
             q,
             k,
             v,
@@ -634,7 +635,8 @@ impl Talker {
             NUM_HEADS,
             NUM_KV_HEADS,
             EPS,
-        )
+        )?
+        .with_rope_theta(TALKER_ROPE_THETA))
     }
 
     /// Load one code predictor transformer block (5 total — no QK norms, no LayerScale).
@@ -679,7 +681,7 @@ impl Talker {
         let als: Option<Tensor> = None;
         let mls: Option<Tensor> = None;
 
-        TransformerBlock::from_weights(
+        Ok(TransformerBlock::from_weights(
             q,
             k,
             v,
@@ -696,7 +698,8 @@ impl Talker {
             NUM_HEADS,
             NUM_KV_HEADS,
             EPS,
-        )
+        )?
+        .with_rope_theta(TALKER_ROPE_THETA))
     }
 
     /// Validate tensor shape.
