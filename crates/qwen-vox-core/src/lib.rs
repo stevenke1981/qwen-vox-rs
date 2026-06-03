@@ -37,8 +37,8 @@ pub use decoder::TtsDecoder;
 pub use error::VoxError;
 pub use error::VoxResult;
 pub use quantizer::{
-    load_decoder_codebooks, CodePredictor, EuclideanCodebook, ResidualVectorQuantizer,
-    SplitResidualVectorQuantizer,
+    load_decoder_codebooks, load_encoder_codebooks, load_encoder_quantizer, CodePredictor,
+    EuclideanCodebook, ResidualVectorQuantizer, SplitResidualVectorQuantizer,
 };
 pub use speech_synth::{synthesize_formant_speech, FormantSynthConfig};
 pub use weights::{ComponentWeights, WeightStore};

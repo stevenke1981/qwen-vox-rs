@@ -1,7 +1,7 @@
 //! Quantizer for Qwen3-TTS decoder (Candle 0.9+).
 //!
 //! Provides:
-//! - `EuclideanCodebook`: simple vector lookup by index
+//! - `EuclideanCodebook`: nearest-neighbor encode and vector lookup by index
 //! - `ResidualVectorQuantizer`: multi-layer RVQ with input/output projections (conv1d k=1)
 //! - `SplitResidualVectorQuantizer`: semantic (1-layer) + acoustic (15-layer) RVQ
 //! - `CodePredictor`: MTP head with 15 codec embeddings + 15 lm_heads for residual code prediction
@@ -60,6 +60,36 @@ impl EuclideanCodebook {
         };
         let selected = self.embedding.index_select(&flat, 0)?;
         selected.reshape((batch, seq_len, self.dim))
+    }
+
+    /// Encode vectors to nearest codebook indices.
+    ///
+    /// # Arguments
+    /// * `hidden_states` - [batch, seq_len, dim] float tensor
+    ///
+    /// # Returns
+    /// Indices of shape [batch, seq_len].
+    pub fn encode(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        let (batch, seq_len, dim) = hidden_states.dims3()?;
+        if dim != self.dim {
+            return Err(candle_core::Error::Msg(format!(
+                "codebook encode expected dim {}, got {dim}",
+                self.dim
+            )));
+        }
+
+        let flat = hidden_states
+            .to_dtype(DType::F32)?
+            .reshape((batch * seq_len, dim))?;
+        let embedding = self.embedding.to_dtype(DType::F32)?;
+
+        // Squared Euclidean distance:
+        // ||x - e||^2 = ||x||^2 + ||e||^2 - 2*x.e
+        let x_sq = flat.sqr()?.sum_keepdim(1)?;
+        let e_sq = embedding.sqr()?.sum_keepdim(1)?.t()?;
+        let dot = flat.matmul(&embedding.t()?)?;
+        let dists = x_sq.broadcast_add(&e_sq)?.sub(&dot.affine(2.0, 0.0)?)?;
+        dists.argmin(1)?.reshape((batch, seq_len))
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -184,6 +214,33 @@ impl ResidualVectorQuantizer {
         out.transpose(1, 2)
     }
 
+    /// Encode hidden features through this RVQ.
+    ///
+    /// `embeddings` follows the Mimi conv convention `[batch, hidden_dim, seq_len]`.
+    /// Each RVQ stage returns one `[batch, seq_len]` code tensor.
+    pub fn encode(&self, embeddings: &Tensor, num_layers: Option<usize>) -> Result<Vec<Tensor>> {
+        let layers = num_layers.unwrap_or(self.num_layers);
+        if layers == 0 || layers > self.num_layers {
+            return Err(candle_core::Error::Msg(format!(
+                "RVQ encode requested {layers} layers, available {}",
+                self.num_layers
+            )));
+        }
+
+        let mut residual = embeddings.conv1d(&self.input_proj, 0, 1, 1, 1)?;
+        let mut all_codes = Vec::with_capacity(layers);
+
+        for codebook in self.codebooks.iter().take(layers) {
+            let residual_bt = residual.transpose(1, 2)?;
+            let indices = codebook.encode(&residual_bt)?;
+            let quantized = codebook.decode(&indices)?.transpose(1, 2)?;
+            residual = residual.sub(&quantized)?;
+            all_codes.push(indices);
+        }
+
+        Ok(all_codes)
+    }
+
     pub fn num_layers(&self) -> usize {
         self.num_layers
     }
@@ -230,6 +287,31 @@ impl SplitResidualVectorQuantizer {
         let first = self.rvq_first.decode(&codes[0..1])?;
         let rest = self.rvq_rest.decode(&codes[1..])?;
         first.add(&rest)
+    }
+
+    /// Encode with the split Mimi/Qwen3 tokenizer RVQ.
+    ///
+    /// `embeddings` is `[batch, hidden_dim, seq_len]`. The returned vector is
+    /// ordered as official Qwen3-TTS codes: semantic q0 first, then acoustic
+    /// q1..q15 for the requested 16-code ICL prompt path.
+    pub fn encode(&self, embeddings: &Tensor, num_quantizers: usize) -> Result<Vec<Tensor>> {
+        if num_quantizers < 1 {
+            return Err(candle_core::Error::Msg(
+                "SplitRVQ encode requires at least one quantizer".into(),
+            ));
+        }
+        if num_quantizers > 16 {
+            return Err(candle_core::Error::Msg(format!(
+                "SplitRVQ encode supports up to 16 quantizers, got {num_quantizers}"
+            )));
+        }
+
+        let mut codes = self.rvq_first.encode(embeddings, Some(1))?;
+        if num_quantizers > 1 {
+            let mut acoustic = self.rvq_rest.encode(embeddings, Some(num_quantizers - 1))?;
+            codes.append(&mut acoustic);
+        }
+        Ok(codes)
     }
 }
 
@@ -383,6 +465,63 @@ pub fn load_decoder_codebooks(store: &WeightStore) -> VoxResult<Vec<Tensor>> {
     Ok(codebooks)
 }
 
+/// Load normalized encoder-side codebook embeddings.
+///
+/// The encoder Mimi quantizer stores EMA state with `embed_sum` keys, while the
+/// decoder-side quantizer uses a separate `embedding_sum` namespace. These are
+/// intentionally kept separate because official Qwen3-TTS ships both sets.
+pub fn load_encoder_codebooks(store: &WeightStore) -> VoxResult<Vec<Tensor>> {
+    let mut codebooks = Vec::with_capacity(16);
+
+    let first_key =
+        "encoder.quantizer.semantic_residual_vector_quantizer.layers.0.codebook.embed_sum";
+    let first_usage_key =
+        "encoder.quantizer.semantic_residual_vector_quantizer.layers.0.codebook.cluster_usage";
+    codebooks.push(normalized_codebook_embedding(
+        store,
+        first_key,
+        first_usage_key,
+    )?);
+
+    for i in 0..15 {
+        let key = format!(
+            "encoder.quantizer.acoustic_residual_vector_quantizer.layers.{i}.codebook.embed_sum"
+        );
+        let usage_key = format!(
+            "encoder.quantizer.acoustic_residual_vector_quantizer.layers.{i}.codebook.cluster_usage"
+        );
+        codebooks.push(normalized_codebook_embedding(store, &key, &usage_key)?);
+    }
+
+    Ok(codebooks)
+}
+
+/// Build the encoder-side split RVQ from official Qwen3-TTS tokenizer weights.
+pub fn load_encoder_quantizer(store: &WeightStore) -> VoxResult<SplitResidualVectorQuantizer> {
+    let semantic_ip = store
+        .require("encoder.quantizer.semantic_residual_vector_quantizer.input_proj.weight")?
+        .clone();
+    let semantic_op = store
+        .require("encoder.quantizer.semantic_residual_vector_quantizer.output_proj.weight")?
+        .clone();
+    let acoustic_ip = store
+        .require("encoder.quantizer.acoustic_residual_vector_quantizer.input_proj.weight")?
+        .clone();
+    let acoustic_op = store
+        .require("encoder.quantizer.acoustic_residual_vector_quantizer.output_proj.weight")?
+        .clone();
+
+    let mut codebooks = load_encoder_codebooks(store)?;
+    let acoustic_codebooks = codebooks.split_off(1);
+    let semantic_codebook = codebooks;
+
+    let rvq_first =
+        ResidualVectorQuantizer::from_weights(semantic_ip, semantic_op, semantic_codebook)?;
+    let rvq_rest =
+        ResidualVectorQuantizer::from_weights(acoustic_ip, acoustic_op, acoustic_codebooks)?;
+    SplitResidualVectorQuantizer::from_weights(rvq_first, rvq_rest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,6 +553,77 @@ mod tests {
         // [2,3]  (idx1)
         // [0,1]  (idx0)
         assert_eq!(flat, vec![0.0, 1.0, 4.0, 5.0, 2.0, 3.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn test_euclidean_codebook_encode_nearest() {
+        let device = Device::Cpu;
+        let embedding = Tensor::from_vec(
+            vec![
+                0.0f32, 0.0, //
+                2.0, 0.0, //
+                0.0, 3.0,
+            ],
+            (3, 2),
+            &device,
+        )
+        .unwrap();
+        let cb = EuclideanCodebook::from_embedding(embedding).unwrap();
+        let hidden = Tensor::from_vec(
+            vec![
+                0.1f32, 0.2, //
+                1.8, 0.1, //
+                0.2, 2.9, //
+                1.2, 0.0,
+            ],
+            (1, 4, 2),
+            &device,
+        )
+        .unwrap();
+
+        let encoded = cb.encode(&hidden).unwrap();
+        assert_eq!(encoded.dims(), &[1, 4]);
+        let ids: Vec<u32> = encoded.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(ids, vec![0, 1, 2, 1]);
+    }
+
+    #[test]
+    fn test_residual_vector_quantizer_encode_residual_order() {
+        let device = Device::Cpu;
+        let input_proj = Tensor::from_vec(vec![1.0f32, 0.0, 0.0, 1.0], (2, 2, 1), &device).unwrap();
+        let output_proj = input_proj.clone();
+        let first_codebook = Tensor::from_vec(
+            vec![
+                0.0f32, 0.0, //
+                1.0, 0.0,
+            ],
+            (2, 2),
+            &device,
+        )
+        .unwrap();
+        let second_codebook = Tensor::from_vec(
+            vec![
+                0.0f32, 0.0, //
+                0.0, 1.0,
+            ],
+            (2, 2),
+            &device,
+        )
+        .unwrap();
+        let rvq = ResidualVectorQuantizer::from_weights(
+            input_proj,
+            output_proj,
+            vec![first_codebook, second_codebook],
+        )
+        .unwrap();
+        let hidden = Tensor::from_vec(vec![1.0f32, 1.0], (1, 2, 1), &device).unwrap();
+
+        let codes = rvq.encode(&hidden, None).unwrap();
+        assert_eq!(codes.len(), 2);
+        let first: Vec<u32> = codes[0].flatten_all().unwrap().to_vec1().unwrap();
+        let second: Vec<u32> = codes[1].flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(first, vec![1]);
+        assert_eq!(second, vec![1]);
     }
 
     #[test]
