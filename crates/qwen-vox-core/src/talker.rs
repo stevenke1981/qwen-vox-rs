@@ -102,9 +102,9 @@ pub struct Talker {
 
     // ── Code predictor ──
     small_to_mtp: Option<(Tensor, Tensor)>, // [cp_hidden, hidden] + [cp_hidden]
-    cp_transformer: TransformerStack, // 5 layers (no QK norms, no LayerScale)
-    cp_lm_heads: Vec<Tensor>,         // 15 × [2048, cp_hidden]
-    cp_codec_embeddings: Vec<Tensor>, // 15 × [2048, hidden]
+    cp_transformer: TransformerStack,       // 5 layers (no QK norms, no LayerScale)
+    cp_lm_heads: Vec<Tensor>,               // 15 × [2048, cp_hidden]
+    cp_codec_embeddings: Vec<Tensor>,       // 15 × [2048, hidden]
 }
 
 impl Talker {
@@ -139,11 +139,7 @@ impl Talker {
         let text_proj_fc1_b = store
             .require("talker.text_projection.linear_fc1.bias")?
             .clone();
-        Self::check_shape(
-            &text_proj_fc1_b,
-            &[text_proj_hidden],
-            "text_proj.fc1.b",
-        )?;
+        Self::check_shape(&text_proj_fc1_b, &[text_proj_hidden], "text_proj.fc1.b")?;
         let text_proj_fc2_w = store
             .require("talker.text_projection.linear_fc2.weight")?
             .clone();
@@ -187,25 +183,24 @@ impl Talker {
         Self::check_shape(&codec_head, &[CODEC_VOCAB, hidden], "codec_head")?;
 
         // ── 5. Code predictor ──
-        let (small_to_mtp, cp_hidden) = if let Some(w) =
-            store.get("talker.code_predictor.small_to_mtp_projection.weight")
-        {
-            let w = w.clone();
-            let (cp_hidden, projection_input) = w.dims2()?;
-            if projection_input != hidden {
-                return Err(VoxError::ShapeMismatch {
-                    expected: vec![cp_hidden, hidden],
-                    actual: w.dims().to_vec(),
-                });
-            }
-            let b = store
-                .require("talker.code_predictor.small_to_mtp_projection.bias")?
-                .clone();
-            Self::check_shape(&b, &[cp_hidden], "small_to_mtp.b")?;
-            (Some((w, b)), cp_hidden)
-        } else {
-            (None, hidden)
-        };
+        let (small_to_mtp, cp_hidden) =
+            if let Some(w) = store.get("talker.code_predictor.small_to_mtp_projection.weight") {
+                let w = w.clone();
+                let (cp_hidden, projection_input) = w.dims2()?;
+                if projection_input != hidden {
+                    return Err(VoxError::ShapeMismatch {
+                        expected: vec![cp_hidden, hidden],
+                        actual: w.dims().to_vec(),
+                    });
+                }
+                let b = store
+                    .require("talker.code_predictor.small_to_mtp_projection.bias")?
+                    .clone();
+                Self::check_shape(&b, &[cp_hidden], "small_to_mtp.b")?;
+                (Some((w, b)), cp_hidden)
+            } else {
+                (None, hidden)
+            };
 
         let num_cp_layers = Self::count_layers(store, "talker.code_predictor.model.layers")?;
         let mut cp_blocks = Vec::with_capacity(num_cp_layers);
@@ -219,7 +214,11 @@ impl Talker {
         let cp_norm_w = store
             .require("talker.code_predictor.model.norm.weight")?
             .clone();
-        Self::check_shape(&cp_norm_w, &[cp_hidden], "talker.code_predictor.model.norm.weight")?;
+        Self::check_shape(
+            &cp_norm_w,
+            &[cp_hidden],
+            "talker.code_predictor.model.norm.weight",
+        )?;
         let cp_norm = RmsNorm::from_weight(cp_norm_w, EPS);
 
         let cp_transformer = TransformerStack::from_blocks(cp_blocks, Some(cp_norm), None, None);

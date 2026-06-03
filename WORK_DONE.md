@@ -78,6 +78,11 @@ Latest validation:
     The first attempt exposed that `weights/model-0.6b` is missing `merges.txt`,
     so the probe used `--tokenizer weights/hf_original` while keeping Base
     talker and decoder weights.
+  - Speaker encoder loader now recognizes both official whole-model
+    `speaker_encoder.*` keys and bare component `asp.*` / `blocks.*` keys.
+  - Speaker encoder metadata now reports mel dimension 128 and embedding
+    dimension 1024 from the loaded weights; `forward()` returns an explicit
+    not-implemented error instead of panicking.
 - Minnan / Taiwan Taigi feature reference:
   - Added `docs/qwen3_tts_minnan_hokkien_guide.md` with Qwen3-TTS Voice Design,
     CustomVoice, and Voice Clone usage targets for Minnan / Hokkien / Taiwan
