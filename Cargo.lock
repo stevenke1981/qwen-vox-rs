@@ -1216,6 +1216,8 @@ dependencies = [
  "clap",
  "hound",
  "qwen-vox-core",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

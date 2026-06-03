@@ -3,7 +3,7 @@
 //! Loads converted weights from SafeTensors format into Candle tensors.
 
 use crate::error::{VoxError, VoxResult};
-use candle_core::{safetensors::Load, Device, Tensor};
+use candle_core::{safetensors::Load, DType, Device, Tensor};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -36,10 +36,16 @@ impl WeightStore {
             .map_err(|e| VoxError::WeightLoad(format!("failed to mmap {}: {e}", path.display())))?;
         let mut tensors = HashMap::new();
 
+        let force_f16 = std::env::var_os("QWEN_VOX_FORCE_F16_WEIGHTS").is_some();
         for (name, view) in st.tensors() {
-            let tensor = view.load(device).map_err(|e| {
+            let mut tensor = view.load(device).map_err(|e| {
                 VoxError::WeightLoad(format!("failed to load tensor '{name}': {e}"))
             })?;
+            if force_f16 && tensor.dtype() == DType::BF16 {
+                tensor = tensor.to_dtype(DType::F16).map_err(|e| {
+                    VoxError::WeightLoad(format!("failed to convert tensor '{name}' to f16: {e}"))
+                })?;
+            }
 
             tensors.insert(name.to_string(), tensor);
         }

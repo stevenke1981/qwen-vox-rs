@@ -12,6 +12,7 @@ use qwen_vox_core::sampling::SamplingConfig;
 use qwen_vox_core::talker::Talker;
 use qwen_vox_core::tokenizer::Tokenizer;
 use qwen_vox_core::weights::WeightStore;
+use serde::Deserialize;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -117,6 +118,28 @@ enum Commands {
 
     /// Show decoder information.
     Info,
+
+    /// Decode pre-generated q0..q15 codec frames from JSON into a WAV.
+    DecodeFrames {
+        /// Input JSON file. Accepts either {"frames": [[...]]} or a raw [[...]] array.
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Output WAV file path.
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Path to speech tokenizer decoder weights (SafeTensors).
+        #[arg(
+            long,
+            default_value = "weights/hf_original/speech_tokenizer/model.safetensors"
+        )]
+        decoder_weights: PathBuf,
+
+        /// Compute device: "cpu", "cuda", or "metal".
+        #[arg(long, default_value = "cpu")]
+        device: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -261,7 +284,54 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
+        Commands::DecodeFrames {
+            input,
+            output,
+            decoder_weights,
+            device,
+        } => decode_frames_json(&input, &output, &decoder_weights, &device),
     }
+}
+
+fn decode_frames_json(
+    input: &PathBuf,
+    output: &PathBuf,
+    decoder_weights: &PathBuf,
+    device: &str,
+) -> Result<()> {
+    let started = Instant::now();
+    let dev_mgr =
+        DeviceManager::from_str(device).with_context(|| format!("invalid device '{device}'"))?;
+    let frames = read_codec_frames_json(input)
+        .with_context(|| format!("failed to read codec frames from {}", input.display()))?;
+    if frames.is_empty() {
+        anyhow::bail!("codec frame JSON contains zero frames");
+    }
+    tracing::info!(
+        "Decoding {} codec frames from {} on device={device}",
+        frames.len(),
+        input.display()
+    );
+
+    let decoder_store =
+        WeightStore::from_file(decoder_weights, dev_mgr.device()).with_context(|| {
+            format!(
+                "failed to load decoder weights {}",
+                decoder_weights.display()
+            )
+        })?;
+    let pipeline = TtsPipeline::from_tokenizer_weights(decoder_store)
+        .context("failed to build Qwen3-TTS codec decoder")?;
+    let waveform = pipeline
+        .decode_frame_codes(&frames)
+        .context("Qwen3-TTS codec decoder failed")?;
+    write_tensor_wav(output, TOKENIZER_SAMPLE_RATE, &waveform)?;
+    tracing::info!(
+        "Decoded frames to {} in {:.2?}",
+        output.display(),
+        started.elapsed()
+    );
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -632,6 +702,24 @@ fn write_codec_frames_json(path: &PathBuf, frames: &[[u16; 16]]) -> Result<()> {
     writeln!(writer, "  ]")?;
     writeln!(writer, "}}")?;
     Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CodecFramesJson {
+    Wrapped { frames: Vec<[u16; 16]> },
+    Raw(Vec<[u16; 16]>),
+}
+
+fn read_codec_frames_json(path: &PathBuf) -> Result<Vec<[u16; 16]>> {
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let parsed: CodecFramesJson = serde_json::from_reader(file)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let frames = match parsed {
+        CodecFramesJson::Wrapped { frames } => frames,
+        CodecFramesJson::Raw(frames) => frames,
+    };
+    Ok(frames)
 }
 
 #[cfg(test)]

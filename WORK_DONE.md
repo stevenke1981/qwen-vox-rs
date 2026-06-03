@@ -86,6 +86,26 @@ Latest validation:
     (frame1 diverged earlier around q4), so it was reverted. The next target is
     full code predictor dtype/cache-position parity, not only the final logits
     projection.
+- Decoder boundary check with official frames:
+  - Added `qwen-vox decode-frames` to decode pre-generated q0..q15 frame JSON
+    without running the talker.
+  - Converted `out/official_residual_probe_codes.npy` to
+    `out/official_residual_probe_codes.json` and decoded it with Rust:
+    `out/rust_decode_official_residual_probe.wav`.
+  - Rust decoder output from official frames has similar zero-crossing rate to
+    the official WAV (`0.0378` vs `0.0386`) and no clipping, while Rust-generated
+    frames have a higher rate (`0.055+`).
+  - Conclusion: decoder can decode known-good official frames much more
+    plausibly; the main remaining failure is talker codec-frame generation.
+  - Decoder still outputs 28800 samples for 15 frames while official emits 28245
+    samples, so final frame duration / tail crop parity remains to be fixed.
+- Weight dtype diagnostic:
+  - Official safetensors contain BF16 talker/code-predictor weights, but the
+    reference script loads the model with `torch_dtype=torch.float16`.
+  - Added `QWEN_VOX_FORCE_F16_WEIGHTS=1` as a diagnostic switch to convert BF16
+    weights to F16 at load time.
+  - This makes early q0 tokens closer to official in one probe but does not fix
+    frame1/q9 residual divergence, so it is not enabled by default.
 
 ## Completed In This Stage
 
@@ -130,6 +150,11 @@ Latest validation:
 - `crates/qwen-vox-cli/src/main.rs`
   - Adds `--dump-codec-frames` and defaults tokenizer loading to `weights/hf_original`.
   - Adds `--dump-residual-topk` for Rust q1..q15 logits JSONL probes.
+  - Adds `decode-frames` for Rust decoder validation against known codec frames.
+- `crates/qwen-vox-cli/Cargo.toml`
+  - Adds `serde` / `serde_json` for codec-frame JSON input parsing.
+- `crates/qwen-vox-core/src/weights.rs`
+  - Adds `QWEN_VOX_FORCE_F16_WEIGHTS=1` diagnostic BF16-to-F16 loading switch.
 - `crates/qwen-vox-core/src/tokenizer.rs`
   - Loads official HF tokenizer directories, merges added special tokens, and preserves ChatML special tokens before BPE.
 - `crates/qwen-vox-core/src/transformer.rs`
