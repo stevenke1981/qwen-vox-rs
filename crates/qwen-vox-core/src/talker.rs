@@ -40,11 +40,15 @@ use std::io::Write;
 const TEXT_VOCAB: usize = 151936;
 const CODEC_VOCAB: usize = 3072;
 const CODEBOOK_SIZE: usize = 2048;
+#[cfg(test)]
 const HIDDEN: usize = 2048;
+#[cfg(test)]
 const CP_HIDDEN: usize = 1024;
 const NUM_HEADS: usize = 16;
 const NUM_KV_HEADS: usize = 8;
+#[cfg(test)]
 const NUM_BACKBONE_LAYERS: usize = 28;
+#[cfg(test)]
 const NUM_CP_LAYERS: usize = 5;
 const NUM_RESIDUAL_CODES: usize = 15;
 const EPS: f64 = 1e-6;
@@ -80,28 +84,27 @@ const _CODEC_PAD: u32 = 2148;
 /// The autoregressive acoustic model that predicts RVQ codes from phone tokens.
 pub struct Talker {
     // ── Embeddings ──
-    text_embedding: Tensor,  // [151936, 2048]
-    codec_embedding: Tensor, // [3072, 2048]
+    text_embedding: Tensor,  // [151936, text_hidden]
+    codec_embedding: Tensor, // [3072, hidden]
 
     // ── Text projection (fc1 → SiLU → fc2) ──
-    text_proj_fc1_w: Tensor, // [2048, 2048]
-    text_proj_fc1_b: Tensor, // [2048]
-    text_proj_fc2_w: Tensor, // [2048, 2048]
-    text_proj_fc2_b: Tensor, // [2048]
+    text_proj_fc1_w: Tensor, // [text_proj_hidden, text_hidden]
+    text_proj_fc1_b: Tensor, // [text_proj_hidden]
+    text_proj_fc2_w: Tensor, // [hidden, text_proj_hidden]
+    text_proj_fc2_b: Tensor, // [hidden]
 
     // ── Backbone ──
     backbone: TransformerStack, // 28 layers (GQA+QK norms+LayerScale)
     final_norm: RmsNorm,        // final RMSNorm after backbone
 
     // ── Codec head ──
-    codec_head: Tensor, // [3072, 2048]
+    codec_head: Tensor, // [3072, hidden]
 
     // ── Code predictor ──
-    small_to_mtp_w: Tensor,           // [1024, 2048]
-    small_to_mtp_b: Tensor,           // [1024]
+    small_to_mtp: Option<(Tensor, Tensor)>, // [cp_hidden, hidden] + [cp_hidden]
     cp_transformer: TransformerStack, // 5 layers (no QK norms, no LayerScale)
-    cp_lm_heads: Vec<Tensor>,         // 15 × [2048, 1024]
-    cp_codec_embeddings: Vec<Tensor>, // 15 × [2048, 2048]
+    cp_lm_heads: Vec<Tensor>,         // 15 × [2048, cp_hidden]
+    cp_codec_embeddings: Vec<Tensor>, // 15 × [2048, hidden]
 }
 
 impl Talker {
@@ -113,34 +116,59 @@ impl Talker {
     pub fn from_store(store: &WeightStore) -> VoxResult<Self> {
         let device = store.device().clone();
 
-        // ── 1. Embeddings ──
+        // ── 1. Text embedding/projection ──
         let text_embedding = store.require("talker.model.text_embedding.weight")?.clone();
-        Self::check_shape(&text_embedding, &[TEXT_VOCAB, HIDDEN], "text_embedding")?;
+        let (text_vocab, text_hidden) = text_embedding.dims2()?;
+        if text_vocab != TEXT_VOCAB {
+            return Err(VoxError::ShapeMismatch {
+                expected: vec![TEXT_VOCAB, text_hidden],
+                actual: text_embedding.dims().to_vec(),
+            });
+        }
 
-        let codec_embedding = store
-            .require("talker.model.codec_embedding.weight")?
-            .clone();
-        Self::check_shape(&codec_embedding, &[CODEC_VOCAB, HIDDEN], "codec_embedding")?;
-
-        // ── 2. Text projection ──
         let text_proj_fc1_w = store
             .require("talker.text_projection.linear_fc1.weight")?
             .clone();
-        Self::check_shape(&text_proj_fc1_w, &[HIDDEN, HIDDEN], "text_proj.fc1.w")?;
+        let (text_proj_hidden, text_proj_input) = text_proj_fc1_w.dims2()?;
+        if text_proj_input != text_hidden {
+            return Err(VoxError::ShapeMismatch {
+                expected: vec![text_proj_hidden, text_hidden],
+                actual: text_proj_fc1_w.dims().to_vec(),
+            });
+        }
         let text_proj_fc1_b = store
             .require("talker.text_projection.linear_fc1.bias")?
             .clone();
+        Self::check_shape(
+            &text_proj_fc1_b,
+            &[text_proj_hidden],
+            "text_proj.fc1.b",
+        )?;
         let text_proj_fc2_w = store
             .require("talker.text_projection.linear_fc2.weight")?
             .clone();
-        Self::check_shape(&text_proj_fc2_w, &[HIDDEN, HIDDEN], "text_proj.fc2.w")?;
+        let (hidden, text_proj_output_input) = text_proj_fc2_w.dims2()?;
+        if text_proj_output_input != text_proj_hidden {
+            return Err(VoxError::ShapeMismatch {
+                expected: vec![hidden, text_proj_hidden],
+                actual: text_proj_fc2_w.dims().to_vec(),
+            });
+        }
         let text_proj_fc2_b = store
             .require("talker.text_projection.linear_fc2.bias")?
             .clone();
+        Self::check_shape(&text_proj_fc2_b, &[hidden], "text_proj.fc2.b")?;
+
+        // ── 2. Codec embedding ──
+        let codec_embedding = store
+            .require("talker.model.codec_embedding.weight")?
+            .clone();
+        Self::check_shape(&codec_embedding, &[CODEC_VOCAB, hidden], "codec_embedding")?;
 
         // ── 3. Backbone layers ──
-        let mut backbone_blocks = Vec::with_capacity(NUM_BACKBONE_LAYERS);
-        for i in 0..NUM_BACKBONE_LAYERS {
+        let num_backbone_layers = Self::count_layers(store, "talker.model.layers")?;
+        let mut backbone_blocks = Vec::with_capacity(num_backbone_layers);
+        for i in 0..num_backbone_layers {
             let lp = format!("talker.model.layers.{i}");
             let block = Self::load_backbone_block(store, &lp, &device)?;
             backbone_blocks.push(block);
@@ -148,6 +176,7 @@ impl Talker {
 
         // Final RMSNorm
         let norm_w = store.require("talker.model.norm.weight")?.clone();
+        Self::check_shape(&norm_w, &[hidden], "talker.model.norm.weight")?;
         let final_norm = RmsNorm::from_weight(norm_w, EPS);
 
         // Backbone stack: no input/output projections, no final norm (handled separately)
@@ -155,19 +184,32 @@ impl Talker {
 
         // ── 4. Codec head ──
         let codec_head = store.require("talker.codec_head.weight")?.clone();
-        Self::check_shape(&codec_head, &[CODEC_VOCAB, HIDDEN], "codec_head")?;
+        Self::check_shape(&codec_head, &[CODEC_VOCAB, hidden], "codec_head")?;
 
         // ── 5. Code predictor ──
-        let smtp_w = store
-            .require("talker.code_predictor.small_to_mtp_projection.weight")?
-            .clone();
-        Self::check_shape(&smtp_w, &[CP_HIDDEN, HIDDEN], "small_to_mtp.w")?;
-        let smtp_b = store
-            .require("talker.code_predictor.small_to_mtp_projection.bias")?
-            .clone();
+        let (small_to_mtp, cp_hidden) = if let Some(w) =
+            store.get("talker.code_predictor.small_to_mtp_projection.weight")
+        {
+            let w = w.clone();
+            let (cp_hidden, projection_input) = w.dims2()?;
+            if projection_input != hidden {
+                return Err(VoxError::ShapeMismatch {
+                    expected: vec![cp_hidden, hidden],
+                    actual: w.dims().to_vec(),
+                });
+            }
+            let b = store
+                .require("talker.code_predictor.small_to_mtp_projection.bias")?
+                .clone();
+            Self::check_shape(&b, &[cp_hidden], "small_to_mtp.b")?;
+            (Some((w, b)), cp_hidden)
+        } else {
+            (None, hidden)
+        };
 
-        let mut cp_blocks = Vec::with_capacity(NUM_CP_LAYERS);
-        for i in 0..NUM_CP_LAYERS {
+        let num_cp_layers = Self::count_layers(store, "talker.code_predictor.model.layers")?;
+        let mut cp_blocks = Vec::with_capacity(num_cp_layers);
+        for i in 0..num_cp_layers {
             let lp = format!("talker.code_predictor.model.layers.{i}");
             let block = Self::load_code_predictor_block(store, &lp, &device)?;
             cp_blocks.push(block);
@@ -177,6 +219,7 @@ impl Talker {
         let cp_norm_w = store
             .require("talker.code_predictor.model.norm.weight")?
             .clone();
+        Self::check_shape(&cp_norm_w, &[cp_hidden], "talker.code_predictor.model.norm.weight")?;
         let cp_norm = RmsNorm::from_weight(cp_norm_w, EPS);
 
         let cp_transformer = TransformerStack::from_blocks(cp_blocks, Some(cp_norm), None, None);
@@ -187,12 +230,12 @@ impl Talker {
         for i in 0..NUM_RESIDUAL_CODES {
             let key = format!("talker.code_predictor.lm_head.{i}.weight");
             let head = store.require(&key)?.clone();
-            Self::check_shape(&head, &[CODEBOOK_SIZE, CP_HIDDEN], &key)?;
+            Self::check_shape(&head, &[CODEBOOK_SIZE, cp_hidden], &key)?;
             cp_lm_heads.push(head);
 
             let emb_key = format!("talker.code_predictor.model.codec_embedding.{i}.weight");
             let emb = store.require(&emb_key)?.clone();
-            Self::check_shape(&emb, &[CODEBOOK_SIZE, HIDDEN], &emb_key)?;
+            Self::check_shape(&emb, &[CODEBOOK_SIZE, hidden], &emb_key)?;
             cp_codec_embeddings.push(emb);
         }
 
@@ -206,8 +249,7 @@ impl Talker {
             backbone,
             final_norm,
             codec_head,
-            small_to_mtp_w: smtp_w,
-            small_to_mtp_b: smtp_b,
+            small_to_mtp,
             cp_transformer,
             cp_lm_heads,
             cp_codec_embeddings,
@@ -344,20 +386,25 @@ impl Talker {
         let q0_idx = sample_token_with_rng(&q0_logits_vec, config, q0_history, rng);
 
         // ── q1..q15 via code predictor (autoregressive) ──
-        // Helper: small_to_mtp 2048 → 1024, returns [B, 1, 1024] for transformer input
+        // CustomVoice projects talker hidden to MTP hidden. Base models already
+        // share the same hidden size and omit this projection.
         let project = |x: &Tensor| -> VoxResult<Tensor> {
-            let y = x.broadcast_matmul(&self.small_to_mtp_w.t()?)?;
-            let y = y.broadcast_add(&self.small_to_mtp_b)?;
-            Ok(y.unsqueeze(0)?) // [1, 1, 1024] (squeeze later when needed)
+            let y = if let Some((w, b)) = &self.small_to_mtp {
+                let y = x.broadcast_matmul(&w.t()?)?;
+                y.broadcast_add(b)?
+            } else {
+                x.clone()
+            };
+            Ok(y.unsqueeze(0)?) // [B, 1, cp_hidden] (squeeze later when needed)
         };
 
         // ── Prefill 2 positions ──
         // pos=0: talker hidden (projected)
-        let cp_pre_0 = project(&last)?; // [1, 1, 1024]
-                                        // pos=1: q0 embedding from TALKER codec_embedding (also 2048-dim, projected)
-        let q0_emb = self.embed_code_token(q0_idx as u32)?; // [1, 1, 2048]
-        let q0_emb_2d = q0_emb.squeeze(0)?; // [1, 2048]
-        let cp_pre_1 = project(&q0_emb_2d)?; // [1, 1, 1024]
+        let cp_pre_0 = project(&last)?; // [1, 1, cp_hidden]
+                                        // pos=1: q0 embedding from TALKER codec_embedding (projected when needed)
+        let q0_emb = self.embed_code_token(q0_idx as u32)?; // [1, 1, hidden]
+        let q0_emb_2d = q0_emb.squeeze(0)?; // [1, hidden]
+        let cp_pre_1 = project(&q0_emb_2d)?; // [1, 1, cp_hidden]
 
         let mut codes: Vec<u16> = Vec::with_capacity(NUM_RESIDUAL_CODES);
         let mut residual_config = config.clone();
@@ -733,6 +780,23 @@ impl Talker {
             EPS,
         )?
         .with_rope_theta(TALKER_ROPE_THETA))
+    }
+
+    /// Count contiguous indexed transformer layers under a prefix.
+    fn count_layers(store: &WeightStore, prefix: &str) -> VoxResult<usize> {
+        let mut count = 0;
+        while store
+            .get(&format!("{prefix}.{count}.self_attn.q_proj.weight"))
+            .is_some()
+        {
+            count += 1;
+        }
+        if count == 0 {
+            return Err(VoxError::WeightLoad(format!(
+                "no transformer layers found under {prefix}"
+            )));
+        }
+        Ok(count)
     }
 
     /// Validate tensor shape.

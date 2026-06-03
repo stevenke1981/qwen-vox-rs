@@ -64,11 +64,20 @@ Latest validation:
   - Confirmed `weights/hf_original` is `custom_voice` and cannot clone from
     reference audio by official rules.
   - Confirmed `weights/model-0.6b` is `base` and includes
-    `speaker_encoder_config`, but its talker hidden size is 1024, while the
-    current Rust `Talker` is still specialized for the 1.7B 2048-hidden model.
+    `speaker_encoder_config`; its talker hidden size is 1024, unlike the
+    1.7B CustomVoice hidden=2048 path.
   - Added `qwen-vox clone` CLI scaffolding with Base-model validation and clear
-    errors. Next step is implementing the Base speaker encoder and dynamic
-    0.6B talker loading.
+    errors. Next step is implementing the Base speaker encoder and official
+    clone prompt construction.
+  - Implemented dynamic Talker shape loading so both 1.7B CustomVoice
+    hidden=2048 and 0.6B Base hidden=1024 weights can be constructed.
+  - Base 0.6B omits `talker.code_predictor.small_to_mtp_projection.*`; Rust now
+    treats that path as identity projection, matching the Base weight layout.
+  - Smoke-tested Base 0.6B load/generate with one codec frame:
+    `out/base_dynamic_probe.wav` and `out/base_dynamic_probe_frames.json`.
+    The first attempt exposed that `weights/model-0.6b` is missing `merges.txt`,
+    so the probe used `--tokenizer weights/hf_original` while keeping Base
+    talker and decoder weights.
 - Minnan / Taiwan Taigi feature reference:
   - Added `docs/qwen3_tts_minnan_hokkien_guide.md` with Qwen3-TTS Voice Design,
     CustomVoice, and Voice Clone usage targets for Minnan / Hokkien / Taiwan

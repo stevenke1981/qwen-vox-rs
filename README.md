@@ -102,9 +102,11 @@ type:
   --output out\clone.wav
 ```
 
-The next implementation work is Base speaker encoder support and dynamic 0.6B
-talker loading. Until that is complete, `clone` reports an explicit error after
-validating that Base weights and reference inputs are present.
+Dynamic 0.6B talker loading is implemented and has been smoke-tested with
+`weights/model-0.6b`. The next implementation work is Base speaker encoder
+support and official voice-clone prompt construction. Until that is complete,
+`clone` reports an explicit error after validating that Base weights and
+reference inputs are present.
 
 Useful generation options:
 
