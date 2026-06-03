@@ -152,6 +152,8 @@ def main() -> int:
     parser.add_argument("--output", default="out/official_qwen3_reference.wav")
     parser.add_argument("--codes-output", default="")
     parser.add_argument("--q0-topk-output", default="")
+    parser.add_argument("--residual-topk-output", default="")
+    parser.add_argument("--residual-topk-frames", type=int, default=2)
     parser.add_argument("--argmax", action="store_true")
     parser.add_argument("--cpu", action="store_true")
     args = parser.parse_args()
@@ -218,6 +220,44 @@ def main() -> int:
         wrapped_talker_forward.__signature__ = inspect.signature(original_talker_forward)
         model.talker.forward = wrapped_talker_forward
 
+    residual_topk_records = []
+    if args.residual_topk_output:
+        residual_topk_path = pathlib.Path(args.residual_topk_output).resolve()
+        residual_topk_path.parent.mkdir(parents=True, exist_ok=True)
+        original_code_predictor_forward = model.talker.code_predictor.forward
+        residual_state = {"frame": -1}
+
+        def wrapped_code_predictor_forward(*forward_args, **forward_kwargs):
+            output = original_code_predictor_forward(*forward_args, **forward_kwargs)
+            generation_steps = int(output.generation_steps) - 1
+            inputs_embeds = forward_kwargs.get("inputs_embeds")
+            if inputs_embeds is not None and inputs_embeds.shape[1] > 1:
+                residual_state["frame"] += 1
+
+            frame = residual_state["frame"]
+            q_index = generation_steps + 1
+            if 0 <= frame < args.residual_topk_frames and 1 <= q_index <= 15:
+                logits = output.logits[0, -1].detach().float().cpu()
+                values, indices = torch.topk(logits, k=min(16, logits.numel()))
+                residual_topk_records.append(
+                    {
+                        "format": "official-qwen3-tts-residual-topk-v1",
+                        "frame": int(frame),
+                        "q": int(q_index),
+                        "argmax": int(indices[0]),
+                        "top": [
+                            {"id": int(i), "logit": float(v)}
+                            for i, v in zip(indices.tolist(), values.tolist())
+                        ],
+                    }
+                )
+            return output
+
+        wrapped_code_predictor_forward.__signature__ = inspect.signature(
+            original_code_predictor_forward
+        )
+        model.talker.code_predictor.forward = wrapped_code_predictor_forward
+
     tokenizer = AutoTokenizer.from_pretrained(str(weights_dir), local_files_only=True)
     processor = processing.Qwen3TTSProcessor(tokenizer=tokenizer)
 
@@ -269,6 +309,17 @@ def main() -> int:
         )
 
     print({"generated_frames": [tuple(c.shape) for c in talker_codes_list]})
+    if args.residual_topk_output:
+        residual_topk_path.write_text(
+            json.dumps(residual_topk_records, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        print(
+            {
+                "residual_topk_output": str(residual_topk_path),
+                "residual_topk_records": len(residual_topk_records),
+            }
+        )
     if args.codes_output:
         codes_path = pathlib.Path(args.codes_output).resolve()
         codes_path.parent.mkdir(parents=True, exist_ok=True)

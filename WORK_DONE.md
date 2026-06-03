@@ -73,6 +73,19 @@ Latest validation:
     q0 match rate improved to about `0.733`.
   - Remaining work: incremental generation parity after the first generated
     frame, especially residual code predictor q9+ and subsequent q0 drift.
+- Residual top-k probe:
+  - Added official/Rust residual logits top-k dumps for q1..q15.
+  - Official probe: `out/official_residual_topk.json`.
+  - Rust probe: `out/rust_residual_topk.jsonl`.
+  - First reliable divergence is frame 1 / q9:
+    official picks `344` with logit `18.296875`, while Rust rounds `129`,
+    `344`, and `777` to `18.25` and picks `129` by argmax tie behavior.
+  - q10 and later residuals then diverge because q9 is fed back into the code
+    predictor cache.
+  - A narrow F32-only `lm_head` projection experiment made parity worse
+    (frame1 diverged earlier around q4), so it was reverted. The next target is
+    full code predictor dtype/cache-position parity, not only the final logits
+    projection.
 
 ## Completed In This Stage
 
@@ -110,10 +123,13 @@ Latest validation:
 - `tools/generate_official_reference.py`
   - Reusable upstream Python reference generator for verified human-voice WAVs and optional codec-frame `.npy` dumps.
   - Supports `--argmax` for deterministic frame parity runs.
+  - Supports `--residual-topk-output` for q1..q15 code predictor logits
+    parity probes.
 - `tools/compare_codec_frames.py`
   - Compares official `.npy` codec frames against Rust JSON frame dumps.
 - `crates/qwen-vox-cli/src/main.rs`
   - Adds `--dump-codec-frames` and defaults tokenizer loading to `weights/hf_original`.
+  - Adds `--dump-residual-topk` for Rust q1..q15 logits JSONL probes.
 - `crates/qwen-vox-core/src/tokenizer.rs`
   - Loads official HF tokenizer directories, merges added special tokens, and preserves ChatML special tokens before BPE.
 - `crates/qwen-vox-core/src/transformer.rs`
@@ -124,6 +140,8 @@ Latest validation:
 - `crates/qwen-vox-core/src/talker.rs`
   - Adds optional first-frame q0 logits top-k dump through
     `QWEN_VOX_DUMP_Q0_TOPK`.
+  - Adds optional first-N-frame residual logits top-k dump through
+    `QWEN_VOX_DUMP_RESIDUAL_TOPK`.
   - Code predictor transformer blocks now load official q/k RMSNorm weights.
 - `OFFICIAL_QWEN3_TTS_REFERENCE_FLOW.md`
   - Complete official flow record and Rust rewrite target order.

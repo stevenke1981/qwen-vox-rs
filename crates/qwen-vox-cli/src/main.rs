@@ -88,6 +88,10 @@ enum Commands {
         #[arg(long)]
         dump_q0_topk: Option<PathBuf>,
 
+        /// Write first N frames of q1..q15 residual logits top-k diagnostics as JSONL.
+        #[arg(long)]
+        dump_residual_topk: Option<PathBuf>,
+
         /// Sampling temperature (lower = more deterministic). Use 0 for argmax.
         #[arg(long, default_value_t = 0.9)]
         temperature: f32,
@@ -139,6 +143,7 @@ fn main() -> Result<()> {
             debug_frames,
             dump_codec_frames,
             dump_q0_topk,
+            dump_residual_topk,
             temperature,
             top_k,
             top_p,
@@ -192,6 +197,9 @@ fn main() -> Result<()> {
 
             if let Some(path) = &dump_q0_topk {
                 std::env::set_var("QWEN_VOX_DUMP_Q0_TOPK", path);
+            }
+            if let Some(path) = &dump_residual_topk {
+                std::env::set_var("QWEN_VOX_DUMP_RESIDUAL_TOPK", path);
             }
 
             generate_qwen3_tts(
