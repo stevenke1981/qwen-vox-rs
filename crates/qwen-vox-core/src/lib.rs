@@ -24,6 +24,7 @@ pub mod quantizer;
 pub mod sampling;
 pub mod speaker_encoder;
 pub mod speech_synth;
+pub mod speech_tokenizer_encoder;
 pub mod stream;
 pub mod talker;
 pub mod tokenizer;
@@ -41,4 +42,5 @@ pub use quantizer::{
     EuclideanCodebook, ResidualVectorQuantizer, SplitResidualVectorQuantizer,
 };
 pub use speech_synth::{synthesize_formant_speech, FormantSynthConfig};
+pub use speech_tokenizer_encoder::SpeechTokenizerEncoder;
 pub use weights::{ComponentWeights, WeightStore};
