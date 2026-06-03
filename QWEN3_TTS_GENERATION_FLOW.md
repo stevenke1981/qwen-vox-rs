@@ -128,11 +128,13 @@ from upstream and causes high-frequency noise instead of human speech.
    - `[2154, 2156, language_id, 2157, speaker_id, 2148, 2149]`
    - or `[2155, 2156, 2157, speaker_id?, 2148, 2149]` for auto
 
-5. Rust currently uses a streaming-like embedding layout:
+5. Rust now uses upstream-style CustomVoice `non_streaming_mode=true` embedding
+   layout:
    - role prefix
    - pad/BOS codec prefill
-   - first text token plus final codec token
-   - remaining text tokens are fed as `trailing_text_hidden` one frame at a time
+   - all target text tokens plus TTS_EOS paired with codec PAD
+   - final `tts_pad + codec_bos`
+   - later codec frames add only `tts_pad_embed`
 
 6. Rust talker now has:
    - KV cache
@@ -164,28 +166,31 @@ from upstream and causes high-frequency noise instead of human speech.
 - 16 frames decode to the correct duration:
   - 16 frames -> 30720 samples -> 1.280s at 24 kHz
 - Latest sample:
-  - `out/qwen3_rope_eps_16frames.wav`
-  - code range `[6, 2041]`
+  - `out/qwen3_nonstream_16frames.wav`
+  - code range `[11, 2046]`
   - unique q0 values `13/16`
   - repeated consecutive frames `0`
 - Audio is still not human speech.
 - Metrics still look wrong:
   - RMS level about `-2.73 dB`
-  - peak count about `15696`
+  - peak count about `15703`
   - crest factor about `1.23`
+  - Non-streaming prompt alignment alone did not fix the noise.
 
 ## Highest-Risk Divergence Points
 
 1. Prompt embedding layout.
    - Official CustomVoice defaults to `non_streaming_mode=true`.
-   - Rust currently follows the streaming-like path.
-   - This can shift every hidden state and make all generated codec frames
-     invalid even when the transformer math is otherwise correct.
+   - Rust has been changed to this layout, but the exact token IDs, embedding
+     sequence length, and first hidden state still need numeric trace
+     comparison.
 
 2. Residual code predictor generation.
    - Official code predictor uses its own `generate(...)` state machine.
    - Rust uses a manual loop and argmax for residual codes.
    - If q0 is correct but q1..q15 are wrong, the decoder will output noise.
+   - This is now the highest-priority talker-side divergence after
+     non-streaming prompt alignment.
 
 3. RoPE position ids and attention mask.
    - Official talker derives position ids from attention masks and supports
@@ -264,9 +269,8 @@ Before touching attention math, compare:
 
 Expected first code change if mismatch is confirmed:
 
-- Add a Rust `non_streaming_mode` path that matches upstream CustomVoice.
-- Make it the default for `generate`.
-- Keep streaming-like mode behind an explicit option for later.
+- Fix the Rust `non_streaming_mode` layout until token IDs, sequence length,
+  and q0 logits match upstream.
 
 ### Step 4: Match the first q0 logits
 

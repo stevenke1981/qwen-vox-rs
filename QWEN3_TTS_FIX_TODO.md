@@ -49,6 +49,10 @@
 - `crates/qwen-vox-core/src/talker.rs`
   - Enabled `rope_theta=1000000` for talker backbone and code predictor.
   - Changed talker/code predictor RMSNorm epsilon, including Q/K norm epsilon, to `1e-6`, matching `weights/hf_original/config.json`.
+  - Changed Qwen3 CustomVoice prompt embedding to upstream-style `non_streaming_mode=true`:
+    - prefill all target text plus TTS_EOS with codec PAD
+    - append final `tts_pad + codec_bos`
+    - use only `tts_pad_embed` as trailing text during codec-frame generation
 
 - `crates/qwen-vox-core/src/pipeline.rs`
   - Enabled `rope_theta=10000` for speech tokenizer decoder pre-transformer.
@@ -61,19 +65,20 @@
   - `out/qwen3_rope_smoke.wav` completed on CUDA with `--max-frames 1`.
   - `out/qwen3_rope_16frames.wav` completed on CUDA with `--max-frames 16`.
   - `out/qwen3_rope_eps_16frames.wav` completed on CUDA after Q/K norm epsilon alignment.
+  - `out/qwen3_nonstream_16frames.wav` completed on CUDA after non-streaming prompt embedding alignment.
   - 16 frames -> 30720 samples -> 1.280s at 24 kHz.
-  - latest codec frame diagnostics: code range `[6, 2041]`, unique q0 values `13/16`, repeated consecutive frames `0`.
+  - latest codec frame diagnostics: code range `[11, 2046]`, unique q0 values `13/16`, repeated consecutive frames `0`.
 - The audio is non-silent, but still sounds like high-frequency noise.
 - The remaining issue is now more likely model alignment than final WAV gain:
   - generated codec frames may be invalid
   - talker transformer may be numerically wrong
   - tokenizer decoder may still be numerically wrong for known-good frames
-- FFmpeg metrics for `out/qwen3_rope_eps_16frames.wav` still look unlike normal speech:
+- FFmpeg metrics for `out/qwen3_nonstream_16frames.wav` still look unlike normal speech:
   - RMS level: `-2.73 dB`
   - max volume: `-0.9 dB`
-  - peak count: `15696`
+  - peak count: `15703`
   - crest factor: `1.23`
-  - zero crossing rate: `0.0865`
+  - zero crossing rate: `0.0867`
 
 ## Root-Cause TODO
 
@@ -86,7 +91,8 @@
      - `codec_pad_id = 2148`
      - `codec_bos_id = 2149`
    - Confirm this sequence matches the upstream generation template exactly.
-   - Confirm whether `custom_voice` requires a speaker id or reference speaker embedding. The full model config has speaker IDs such as `serena`, `vivian`, `ryan`, etc.; the current CLI does not expose a speaker option.
+   - Confirm whether `custom_voice` requires a speaker id or reference speaker embedding. The full model config has speaker IDs such as `serena`, `vivian`, `ryan`, etc.
+   - Non-streaming text prefill has now been implemented in Rust, but still needs numeric trace comparison.
 
 2. Replace hard-coded speaker IDs with config-driven speaker IDs.
    - Parse `spk_id` from `weights/hf_original/config.json`.

@@ -507,19 +507,33 @@ impl Talker {
         let codec_without_last = codec_embed.narrow(1, 0, codec_len - 1)?;
         let prefill_embed = text_prefill.add(&codec_without_last)?;
 
-        let first_text = self
-            .encode_text(&input_tokens[3..4])?
-            .add(&codec_embed.narrow(1, codec_len - 1, 1)?)?;
+        // Official CustomVoice generation defaults to non_streaming_mode=true:
+        // all target text plus TTS_EOS is prefed with codec_pad, then the final
+        // position is tts_pad + codec_bos. The autoregressive loop therefore
+        // adds only tts_pad for subsequent codec frames.
+        let text_parts = [
+            self.encode_text(&input_tokens[3..input_tokens.len() - 5])?,
+            tts_eos_embed,
+        ];
+        let text_refs: Vec<&Tensor> = text_parts.iter().collect();
+        let text_with_eos = Tensor::cat(&text_refs, 1)?;
 
-        let input_hidden = Tensor::cat(&[&role_embed, &prefill_embed, &first_text], 1)?;
+        let text_codec_pad_ids = vec![2148u32; text_with_eos.dim(1)?];
+        let text_codec_pad = self.embed_codec_prefill(&text_codec_pad_ids)?;
+        let text_with_codec_pad = text_with_eos.add(&text_codec_pad)?;
 
-        let mut trailing_parts = Vec::new();
-        if input_tokens.len() > 9 {
-            trailing_parts.push(self.encode_text(&input_tokens[4..input_tokens.len() - 5])?);
-        }
-        trailing_parts.push(tts_eos_embed);
-        let trailing_refs: Vec<&Tensor> = trailing_parts.iter().collect();
-        let trailing_text_hidden = Tensor::cat(&trailing_refs, 1)?;
+        let final_bos = tts_pad_embed.add(&codec_embed.narrow(1, codec_len - 1, 1)?)?;
+        let input_hidden = Tensor::cat(
+            &[
+                &role_embed,
+                &prefill_embed,
+                &text_with_codec_pad,
+                &final_bos,
+            ],
+            1,
+        )?;
+
+        let trailing_text_hidden = tts_pad_embed.clone();
 
         let mut cache = self.backbone.empty_cache();
         let prefill_mask = causal_mask(input_hidden.dim(1)?, input_hidden.device())?;
