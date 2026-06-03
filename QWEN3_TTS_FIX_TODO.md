@@ -7,6 +7,8 @@
   - `cargo check -p qwen-vox-cli --features cuda`
 - Qwen3 generation now reaches model inference and writes WAV files after fixing the first performance/runtime blockers.
 - Current generated WAV is still unacceptable: it is mostly high-frequency noise and does not sound like real human speech.
+- Upstream generation flow and Rust divergence checklist are documented in:
+  - `QWEN3_TTS_GENERATION_FLOW.md`
 
 ## Fixes Already Applied
 
@@ -141,6 +143,7 @@ cargo run -p qwen-vox-cli --features cuda -- generate --device cuda --text "Hell
 
 Start with TODO 1 plus TODO 4:
 
+- Follow `QWEN3_TTS_GENERATION_FLOW.md`.
 - Export a known-good upstream Python trace for the same text/speaker/language prompt.
 - Compare the Rust prompt token IDs, prefill embedding sequence, first backbone hidden state, first q0 logits, and first residual logits.
 - If q0 logits already diverge before the codec decoder, fix talker prompt/position/cache alignment.
