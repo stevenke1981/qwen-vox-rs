@@ -7,14 +7,21 @@ Make this Rust project generate audible human speech from Qwen3-TTS text input t
 Current target command shape:
 
 ```powershell
-cargo run -p qwen-vox-cli --features cuda -- generate --device cuda --language chinese --speaker vivian --text "你好，這是一段語音測試。" --output out\speech.wav
+.\dist\qwen-vox-cuda.exe generate --device cuda --language chinese --speaker vivian --text "你好，這是一段語音測試。" --output out\speech.wav
 ```
 
 ## Current Status
 
-Not complete yet.
+Functional milestone reached.
 
-The old full-pipeline symptom was full-scale high-frequency noise. Decoder-side clipping has been fixed, but the Rust CLI output still has not been proven to contain human voice. The remaining problem is likely in talker / codec-token generation, not only in the waveform decoder.
+The old full-pipeline symptom was full-scale high-frequency noise. Decoder-side
+clipping has been fixed, talker frame generation has been repaired enough for
+audible human speech, and the Rust CLI can now generate a normal human-voice WAV
+locally. The latest confirmed Rust sample is:
+
+- `out/rust_current_sample64.wav`
+- Command: `cargo run -p qwen-vox-cli --features cuda --bin qwen-vox -- generate --device cuda --language chinese --speaker vivian --text "你好，這是官方 Qwen3 TTS 參考語音。" --max-frames 64 --output out\rust_current_sample64.wav`
+- User confirmed: normal human voice.
 
 Important clarification: `out/python_decoder_test_output.wav` is also not human speech. It is only a PyTorch reference decode of fixed `test_tokens`; those tokens are not known-good speech. Its purpose is numerical decoder comparison, not audible TTS validation.
 
@@ -30,6 +37,9 @@ The first verified upstream human-voice reference is:
 
 Latest validation:
 
+- User listened to `out/rust_current_sample64.wav` and confirmed it is normal
+  human speech.
+- `scripts\build_release.ps1` builds CPU and CUDA release binaries into `dist\`.
 - `python tools\generate_official_reference.py --help` succeeds.
 - `cargo check -p qwen-vox-cli --features cuda` succeeds without warnings.
 - Rust CLI can now dump generated codec frames before decode via
@@ -175,19 +185,18 @@ Latest validation:
 
 ## Remaining Work
 
-1. Do not treat decoder-only WAVs as speech validation.
-2. Use `OFFICIAL_QWEN3_TTS_REFERENCE_FLOW.md` as the reference spec.
-3. Compare Rust vs Python generated codec frames before decoding:
-   - q0 semantic token sequence
-   - q1..q15 residual code predictor outputs
-   - stopping/EOS behavior
-   - sampling defaults and prompt layout
-4. If generated code frames diverge immediately, continue fixing talker:
-   - prompt/prefill layout and generated hidden-state position
-   - causal masks and position IDs/cache positions
-   - code predictor residual generation
-   - sampling / repetition penalty rules
-5. Only mark the project successful when the compiled Rust CLI produces a WAV that can be clearly heard as human speech.
+1. Keep `out/rust_current_sample64.wav` as the first Rust-generated audible
+   human-voice reference.
+2. Continue codec-frame parity work against the official flow:
+   - frame1/q9 residual logits still differ in deterministic argmax probes
+   - later q0/residual frames can diverge from official
+   - decoder frame duration / tail crop is still 28800 vs official 28245 samples
+     for a 15-frame probe
+3. Package and verify local release binaries:
+   - `dist\qwen-vox-cpu.exe`
+   - `dist\qwen-vox-cuda.exe`
+4. CUDA is the practical runtime for the full model; CPU is packaged for
+   completeness and pure-Rust portability.
 
 ## Next Suggested Command Checks
 
