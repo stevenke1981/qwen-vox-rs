@@ -81,8 +81,13 @@ Latest validation:
   - Speaker encoder loader now recognizes both official whole-model
     `speaker_encoder.*` keys and bare component `asp.*` / `blocks.*` keys.
   - Speaker encoder metadata now reports mel dimension 128 and embedding
-    dimension 1024 from the loaded weights; `forward()` returns an explicit
-    not-implemented error instead of panicking.
+    dimension 1024 from the loaded weights.
+  - Implemented Rust ECAPA-TDNN speaker encoder forward:
+    initial TDNN, SE-Res2Net blocks, multi-layer feature aggregation, attentive
+    statistics pooling, and final speaker embedding projection.
+  - Verified `SpeakerEncoder::forward` with unit tests and a local ignored
+    smoke test against `weights/model-0.6b/model.safetensors`; output shape is
+    `[1, 1024]`.
 - Minnan / Taiwan Taigi feature reference:
   - Added `docs/qwen3_tts_minnan_hokkien_guide.md` with Qwen3-TTS Voice Design,
     CustomVoice, and Voice Clone usage targets for Minnan / Hokkien / Taiwan
