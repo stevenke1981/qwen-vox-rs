@@ -521,9 +521,38 @@ impl Talker {
         max_frames: usize,
         config: &SamplingConfig,
     ) -> VoxResult<Vec<[u16; 16]>> {
+        self.generate_qwen3_base_with_speaker_embedding(
+            input_tokens,
+            language_id,
+            speaker_id,
+            None,
+            max_frames,
+            config,
+        )
+    }
+
+    /// Generate codec frames using a Qwen3-TTS Base x-vector speaker embedding.
+    ///
+    /// This matches the official voice-clone `x_vector_only_mode` prompt layout:
+    /// the speaker embedding is inserted between the codec language prefill and
+    /// `[codec_pad, codec_bos]`.
+    pub fn generate_qwen3_base_with_speaker_embedding(
+        &self,
+        input_tokens: &[u32],
+        language_id: Option<u32>,
+        speaker_id: Option<u32>,
+        speaker_embedding: Option<&Tensor>,
+        max_frames: usize,
+        config: &SamplingConfig,
+    ) -> VoxResult<Vec<[u16; 16]>> {
         if input_tokens.len() < 9 {
             return Err(VoxError::Inference(
                 "Qwen3-TTS prompt must contain role/text/end tokens".into(),
+            ));
+        }
+        if speaker_id.is_some() && speaker_embedding.is_some() {
+            return Err(VoxError::Inference(
+                "speaker_id and speaker_embedding are mutually exclusive".into(),
             ));
         }
 
@@ -536,19 +565,36 @@ impl Talker {
         // For the CustomVoice model the speaker token is REQUIRED between
         // codec_think_eos_id and codec_pad_id; without it the model has no voice
         // identity and produces high-frequency noise instead of speech.
-        let mut codec_prefill = match language_id {
+        let mut codec_prefill_0 = match language_id {
             Some(id) => vec![2154, 2156, id, 2157],
             None => vec![2155, 2156, 2157],
         };
         if let Some(spk) = speaker_id {
-            codec_prefill.push(spk);
+            codec_prefill_0.push(spk);
         }
-        codec_prefill.push(2148);
-        codec_prefill.push(2149);
+        let codec_prefill_1 = [2148u32, 2149u32];
 
         let role_embed = self.encode_text(&input_tokens[..3])?;
-        let codec_embed = self.embed_codec_prefill(&codec_prefill)?;
-        let codec_len = codec_prefill.len();
+        let codec_embed_0 = self.embed_codec_prefill(&codec_prefill_0)?;
+        let codec_embed_1 = self.embed_codec_prefill(&codec_prefill_1)?;
+        let codec_embed = if let Some(spk_embed) = speaker_embedding {
+            let (_, hidden) = spk_embed.dims2().map_err(|e| {
+                VoxError::Inference(format!("speaker embedding must be [1, hidden]: {e}"))
+            })?;
+            if hidden != self.codec_embedding.dim(1)? {
+                return Err(VoxError::ShapeMismatch {
+                    expected: vec![1, self.codec_embedding.dim(1)?],
+                    actual: spk_embed.dims().to_vec(),
+                });
+            }
+            let spk_embed = spk_embed
+                .to_dtype(self.codec_embedding.dtype())?
+                .unsqueeze(1)?;
+            Tensor::cat(&[&codec_embed_0, &spk_embed, &codec_embed_1], 1)?
+        } else {
+            Tensor::cat(&[&codec_embed_0, &codec_embed_1], 1)?
+        };
+        let codec_len = codec_embed.dim(1)?;
 
         let pad_count = codec_len.saturating_sub(2);
         let mut prefill_text_parts = Vec::with_capacity(pad_count + 1);

@@ -92,6 +92,18 @@ Latest validation:
     24 kHz validation, `n_fft=1024`, `hop=256`, `win=1024`, `n_mels=128`,
     `fmax=12000`, reflect padding, Hann-window STFT, Slaney mel filterbank, and
     log dynamic range compression.
+  - Added x-vector voice clone prompt construction:
+    the extracted speaker embedding is inserted into the Qwen3-TTS Base codec
+    prefill between language control tokens and `[codec_pad, codec_bos]`.
+  - `qwen-vox clone` now reads a 24 kHz reference WAV, extracts a speaker
+    embedding, generates clone codec frames with Base 0.6B weights, decodes them
+    to WAV, and writes the output.
+  - Smoke-tested clone path:
+    `cargo run -p qwen-vox-cli --features cuda --bin qwen-vox -- clone --model-dir weights/model-0.6b --tokenizer weights/hf_original --device cuda --language chinese --max-frames 4 --seed 123 --ref-audio out/official_qwen3_reference.wav --ref-text "你好，這是官方 Qwen3 TTS 參考語音。" --text "你好，這是克隆語音測試。" --output out/clone_xvector_smoke.wav`
+    produced a 24 kHz mono WAV with 7,680 samples.
+  - Remaining clone work: full ICL mode needs reference codec frames
+    (`ref_code`), which requires implementing the speech tokenizer encoder path;
+    the repository currently has the decoder path.
 - Minnan / Taiwan Taigi feature reference:
   - Added `docs/qwen3_tts_minnan_hokkien_guide.md` with Qwen3-TTS Voice Design,
     CustomVoice, and Voice Clone usage targets for Minnan / Hokkien / Taiwan

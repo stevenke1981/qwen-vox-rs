@@ -95,6 +95,7 @@ type:
 ```powershell
 .\dist\qwen-vox-cuda.exe clone `
   --model-dir weights\model-0.6b `
+  --tokenizer weights\hf_original `
   --device cuda `
   --ref-audio reference.wav `
   --ref-text "Reference transcript text." `
@@ -102,11 +103,14 @@ type:
   --output out\clone.wav
 ```
 
-Dynamic 0.6B talker loading is implemented and has been smoke-tested with
-`weights/model-0.6b`. The next implementation work is Base speaker encoder
-support and official voice-clone prompt construction. Until that is complete,
-`clone` reports an explicit error after validating that Base weights and
-reference inputs are present.
+Dynamic 0.6B talker loading, speaker mel extraction, ECAPA-TDNN speaker
+embedding, and x-vector voice-clone prompt construction are implemented. The
+current `clone` command uses official-style x-vector speaker embedding insertion
+and has been smoke-tested with `weights/model-0.6b`.
+
+Full ICL voice clone with reference codec frames is still pending because it
+requires the speech tokenizer encoder path to produce `ref_code`; this repository
+currently implements the codec decoder path.
 
 Useful generation options:
 

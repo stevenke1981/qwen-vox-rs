@@ -6,9 +6,11 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use qwen_vox_core::audio_features::qwen3_speaker_mel;
 use qwen_vox_core::device::DeviceManager;
 use qwen_vox_core::pipeline::{TtsPipeline, TOKENIZER_FRAME_RATE_HZ, TOKENIZER_SAMPLE_RATE};
 use qwen_vox_core::sampling::SamplingConfig;
+use qwen_vox_core::speaker_encoder::SpeakerEncoder;
 use qwen_vox_core::talker::Talker;
 use qwen_vox_core::tokenizer::Tokenizer;
 use qwen_vox_core::weights::WeightStore;
@@ -160,8 +162,8 @@ enum Commands {
         #[arg(long)]
         ref_audio: PathBuf,
 
-        /// Reference transcript. Required for official ICL clone mode.
-        #[arg(long)]
+        /// Reference transcript. Required for official clone bookkeeping and future ICL mode.
+        #[arg(long, required = true)]
         ref_text: Option<String>,
 
         /// Output WAV file path.
@@ -172,9 +174,25 @@ enum Commands {
         #[arg(long, default_value = "weights/model-0.6b")]
         model_dir: PathBuf,
 
+        /// Path to tokenizer.json or an official HF tokenizer directory.
+        #[arg(long, default_value = "weights/hf_original")]
+        tokenizer: PathBuf,
+
         /// Compute device: "cpu", "cuda", or "metal".
         #[arg(long, default_value = "cuda")]
         device: String,
+
+        /// Language control for Qwen3-TTS: auto, english, chinese, german, italian, or portuguese.
+        #[arg(long, default_value = "chinese")]
+        language: String,
+
+        /// Maximum codec frames to generate. Use 0 to auto-estimate from text length.
+        #[arg(long, default_value_t = AUTO_MAX_FRAMES_SENTINEL)]
+        max_frames: usize,
+
+        /// RNG seed for reproducible sampling. Omit for non-deterministic sampling.
+        #[arg(long)]
+        seed: Option<u64>,
     },
 }
 
@@ -343,14 +361,22 @@ fn main() -> Result<()> {
             ref_text,
             output,
             model_dir,
+            tokenizer,
             device,
+            language,
+            max_frames,
+            seed,
         } => clone_voice(
             &text,
             &ref_audio,
             ref_text.as_deref(),
             &output,
             &model_dir,
+            &tokenizer,
             &device,
+            &language,
+            max_frames,
+            seed,
         ),
     }
 }
@@ -361,8 +387,13 @@ fn clone_voice(
     ref_text: Option<&str>,
     output: &PathBuf,
     model_dir: &PathBuf,
+    tokenizer_path: &PathBuf,
     device: &str,
+    language: &str,
+    max_frames: usize,
+    seed: Option<u64>,
 ) -> Result<()> {
+    let started = Instant::now();
     let config_path = model_dir.join("config.json");
     let config: Value = read_json_file(&config_path)?;
     let tts_model_type = config
@@ -381,12 +412,97 @@ fn clone_voice(
     if ref_text.map(str::trim).unwrap_or("").is_empty() {
         anyhow::bail!("--ref-text is required for official ICL voice clone mode");
     }
-    anyhow::bail!(
-        "voice clone scaffolding is ready, but Base speaker encoder and 0.6B dynamic talker loading are not implemented yet (text='{}', output={}, device={}).",
-        text,
-        output.display(),
-        device
+    if text.trim().is_empty() {
+        anyhow::bail!("text must not be empty");
+    }
+
+    let dev_mgr =
+        DeviceManager::from_str(device).with_context(|| format!("invalid device '{device}'"))?;
+    tracing::info!(
+        "Voice clone: model_dir={}, device={device}",
+        model_dir.display()
     );
+
+    let (ref_samples, ref_sample_rate) = read_wav_mono_f32(ref_audio)
+        .with_context(|| format!("failed to read reference WAV {}", ref_audio.display()))?;
+    tracing::info!(
+        "Loaded reference audio: {} samples at {} Hz in {:.2?}",
+        ref_samples.len(),
+        ref_sample_rate,
+        started.elapsed()
+    );
+    let mel = qwen3_speaker_mel(&ref_samples, ref_sample_rate, dev_mgr.device())
+        .context("failed to compute Qwen3-TTS speaker mel")?;
+
+    let model_weights = model_dir.join("model.safetensors");
+    let model_store =
+        WeightStore::from_file(&model_weights, dev_mgr.device()).with_context(|| {
+            format!(
+                "failed to load Base model weights {}",
+                model_weights.display()
+            )
+        })?;
+    let speaker_encoder =
+        SpeakerEncoder::from_store(&model_store).context("failed to build speaker encoder")?;
+    let speaker_embedding = speaker_encoder
+        .forward(&mel)
+        .context("speaker encoder failed")?;
+    tracing::info!(
+        "Extracted speaker embedding {:?} in {:.2?}",
+        speaker_embedding.dims(),
+        started.elapsed()
+    );
+
+    let tokenizer = Tokenizer::from_file(tokenizer_path)
+        .with_context(|| format!("failed to load tokenizer {}", tokenizer_path.display()))?;
+    let prompt = qwen3_prompt(text);
+    let prompt_tokens = tokenizer
+        .encode(&prompt)
+        .with_context(|| "failed to tokenize Qwen3-TTS ChatML prompt")?;
+
+    let talker = Talker::from_store(&model_store).context("failed to build Base talker")?;
+    let mut sampling_config = SamplingConfig::default();
+    sampling_config.seed = seed;
+    let effective_max_frames = resolve_max_frames(text, max_frames);
+    let frames = talker
+        .generate_qwen3_base_with_speaker_embedding(
+            &prompt_tokens,
+            language_id(language)?,
+            None,
+            Some(&speaker_embedding),
+            effective_max_frames,
+            &sampling_config,
+        )
+        .context("Qwen3-TTS Base talker failed to generate clone codec frames")?;
+    if frames.is_empty() {
+        anyhow::bail!("Qwen3-TTS clone generated zero codec frames");
+    }
+    tracing::info!(
+        "Generated {} clone codec frames in {:.2?}",
+        frames.len(),
+        started.elapsed()
+    );
+
+    let decoder_weights = model_dir.join("speech_tokenizer").join("model.safetensors");
+    let decoder_store =
+        WeightStore::from_file(&decoder_weights, dev_mgr.device()).with_context(|| {
+            format!(
+                "failed to load decoder weights {}",
+                decoder_weights.display()
+            )
+        })?;
+    let pipeline = TtsPipeline::from_tokenizer_weights(decoder_store)
+        .context("failed to build Qwen3-TTS codec decoder")?;
+    let waveform = pipeline
+        .decode_frame_codes(&frames)
+        .context("Qwen3-TTS codec decoder failed")?;
+    write_tensor_wav(output, TOKENIZER_SAMPLE_RATE, &waveform)?;
+    tracing::info!(
+        "Wrote cloned speech to {} in {:.2?}",
+        output.display(),
+        started.elapsed()
+    );
+    Ok(())
 }
 
 fn decode_frames_json(
@@ -716,6 +832,37 @@ fn stretch_waveform_speed(samples: &[f32], speed: f32) -> Vec<f32> {
         out.push(value);
     }
     out
+}
+
+fn read_wav_mono_f32(path: &PathBuf) -> Result<(Vec<f32>, usize)> {
+    let mut reader = hound::WavReader::open(path)?;
+    let spec = reader.spec();
+    let channels = spec.channels.max(1) as usize;
+    let raw = match spec.sample_format {
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+        hound::SampleFormat::Int => {
+            let bits = spec.bits_per_sample.clamp(1, 32);
+            let scale = (1_i64 << (bits - 1)) as f32;
+            reader
+                .samples::<i32>()
+                .map(|s| s.map(|v| (v as f32 / scale).clamp(-1.0, 1.0)))
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        }
+    };
+    if raw.is_empty() {
+        anyhow::bail!("reference WAV contains no samples: {}", path.display());
+    }
+    if channels == 1 {
+        return Ok((raw, spec.sample_rate as usize));
+    }
+
+    let mut mono = Vec::with_capacity(raw.len() / channels);
+    for frame in raw.chunks_exact(channels) {
+        mono.push(frame.iter().sum::<f32>() / channels as f32);
+    }
+    Ok((mono, spec.sample_rate as usize))
 }
 
 fn write_wav(path: &PathBuf, sample_rate: u32, samples: &[f32]) -> Result<()> {
