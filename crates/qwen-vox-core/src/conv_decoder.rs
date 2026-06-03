@@ -116,7 +116,7 @@ impl CausalConv1dLayer {
     }
 }
 
-/// Causal transposed Conv1d (right-crop after upsampling to ensure causality).
+/// Causal transposed Conv1d (crop both sides after upsampling).
 pub struct CausalConvTranspose1dLayer {
     weight: Tensor,       // [in_ch, out_ch/groups, kernel_size]
     bias: Option<Tensor>, // [out_ch]
@@ -147,12 +147,21 @@ impl CausalConvTranspose1dLayer {
         })
     }
 
-    /// Transposed conv + right crop by (k - stride) + bias.
+    /// Transposed conv + crop by (k - stride) on both sides + bias.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let kernel_size = self.weight.dim(2)?;
         let mut h = x.conv_transpose1d(&self.weight, 0, 0, self.stride, 1, 1)?;
+        // PyTorch Qwen3TTSTokenizerV2CausalTransConvNet: conv_transpose1d with padding=0,
+        // then crop RIGHT side only by (kernel_size - stride).
+        // Do NOT crop both sides — left-cropping removes valid past context.
         let crop_size = kernel_size.saturating_sub(self.stride);
         if crop_size > 0 {
+            let len = h.dim(2)?;
+            if crop_size >= len {
+                return Err(candle_core::Error::Msg(format!(
+                    "conv_transpose crop {crop_size} too large for length {len}"
+                )));
+            }
             h = causal_crop_right(&h, crop_size)?;
         }
         if let Some(ref b) = self.bias {

@@ -21,7 +21,7 @@
 //! All convolutions are strictly causal.
 
 use crate::conv_decoder::{CausalConv1dLayer, CausalConvTranspose1dLayer, TokenizerDecoder};
-use crate::custom_ops::layer_scale_3d;
+use crate::custom_ops::{causal_mask, layer_scale_3d};
 use crate::error::{VoxError, VoxResult};
 use crate::quantizer::{
     load_decoder_codebooks, ResidualVectorQuantizer, SplitResidualVectorQuantizer,
@@ -125,17 +125,11 @@ impl ConvNeXtBlock {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let shortcut = x.clone();
 
-        // Norm: [B, C, T] → [B, T, C] → LayerNorm over last dim → [B, T, C]
-        let mut h = x.transpose(1, 2)?;
+        // Official order: depthwise conv → channels-last LayerNorm → pwconv1
+        // → GELU → pwconv2 → LayerScale → residual.
+        let mut h = self.dwconv.forward(x)?;
+        h = h.transpose(1, 2)?;
         h = self.layer_norm.forward(&h)?;
-
-        // Depthwise conv: [B, T, C] → [B, C, T] → causal dw conv → [B, C, T]
-        h = h.transpose(1, 2)?;
-        h = self.dwconv.forward(&h)?;
-
-        // Pointwise: [B, C, T] → [B, T, C] → GELU → pwconv1 → pwconv2
-        h = h.transpose(1, 2)?;
-        h = gelu_erf(&h)?;
 
         let b = h.dim(0)?;
         let t = h.dim(1)?;
@@ -148,6 +142,7 @@ impl ConvNeXtBlock {
         if let Some(ref bias) = self.pwconv1_bias {
             h = h.broadcast_add(bias)?;
         }
+        h = gelu_erf(&h)?;
 
         // pwconv2: contract via Linear [4C] → [C]
         let c2 = h.dim(2)?;
@@ -277,7 +272,9 @@ impl CodecDecoder {
 
         // 3. Pre-transformer: [B, 1024, T] → [B, T, 1024] → blocks → [B, T, 1024] → [B, 1024, T]
         h = h.transpose(1, 2)?;
-        h = self.pre_transformer.forward(&h, None)?;
+        let seq_len = h.dim(1)?;
+        let mask = causal_mask(seq_len, h.device())?;
+        h = self.pre_transformer.forward(&h, Some(&mask))?;
         h = h.transpose(1, 2)?;
 
         // 4. Upsample ×2: [B, 1024, T] → [B, 1024, T×4]

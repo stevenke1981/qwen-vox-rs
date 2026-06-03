@@ -18,21 +18,26 @@ fn cast_like(tensor: &Tensor, like: &Tensor) -> Result<Tensor> {
 
 // ── SnakeBeta Activation ──────────────────────────────────────────────────
 
-/// SnakeBeta activation: `y = x + beta * sin^2(alpha * x)`
+/// SnakeBeta activation: `y = x + (1 / beta) * sin^2(alpha * x)`.
 ///
 /// Used in the tokenizer decoder's ResidualUnit blocks.
 /// Both `alpha` and `beta` are learnable per-channel parameters.
+/// The learned parameters are stored in log-space and exponentiated before use,
+/// matching the upstream Qwen3-TTS tokenizer decoder.
 ///
 /// # Arguments
 /// * `x` - Input tensor of shape `[..., channels]`
 /// * `alpha` - Frequency parameter, shape `[channels]`
-/// * `beta` - Amplitude parameter, shape `[channels]`
+/// * `beta` - Inverse-amplitude parameter, shape `[channels]`
 pub fn snake_beta(x: &Tensor, alpha: &Tensor, beta: &Tensor) -> Result<Tensor> {
     // sin^2(z) = (1 - cos(2z)) / 2  — numerically more stable
     let two = Tensor::new(&[2.0f32], x.device())?.to_dtype(x.dtype())?;
     let one = Tensor::new(&[1.0f32], x.device())?.to_dtype(x.dtype())?;
     let alpha = cast_like(alpha, x)?;
     let beta = cast_like(beta, x)?;
+
+    let alpha = alpha.exp()?;
+    let beta = beta.exp()?;
 
     // alpha * x
     let ax = x.broadcast_mul(&alpha.unsqueeze(0)?)?;
@@ -46,10 +51,10 @@ pub fn snake_beta(x: &Tensor, alpha: &Tensor, beta: &Tensor) -> Result<Tensor> {
     // (1 - cos(2*alpha*x)) / 2 = sin^2(alpha*x)
     let sin_sq = (one.broadcast_sub(&cos_two_ax)?).broadcast_div(&two)?;
 
-    // beta * sin^2(alpha * x)
-    let modulation = beta.unsqueeze(0)?.broadcast_mul(&sin_sq)?;
+    let eps = Tensor::new(&[1e-9f32], x.device())?.to_dtype(x.dtype())?;
+    let beta_denom = beta.unsqueeze(0)?.broadcast_add(&eps)?;
+    let modulation = sin_sq.broadcast_div(&beta_denom)?;
 
-    // x + beta * sin^2(alpha * x)
     x.broadcast_add(&modulation)
 }
 

@@ -326,24 +326,57 @@ impl CodePredictor {
     }
 }
 
-/// Load codebook embeddings from weight store for the decoder quantizer.
-/// The decoder quantizer uses keys like:
-///   decoder.quantizer.rvq_first.vq.layers.0._codebook.embedding_sum
-///   decoder.quantizer.rvq_rest.vq.layers.{0-14}._codebook.embedding_sum
+fn normalized_codebook_embedding(
+    store: &WeightStore,
+    embedding_sum_key: &str,
+    cluster_usage_key: &str,
+) -> VoxResult<Tensor> {
+    let embedding_sum = store.require(embedding_sum_key)?.clone();
+    let cluster_usage = store.require(cluster_usage_key)?.clone();
+    let (vocab, dim) = embedding_sum.dims2().map_err(|e| {
+        VoxError::WeightLoad(format!("{embedding_sum_key} must be [vocab, dim]: {e}"))
+    })?;
+    let usage_len = cluster_usage
+        .dims1()
+        .map_err(|e| VoxError::WeightLoad(format!("{cluster_usage_key} must be [vocab]: {e}")))?;
+    if usage_len != vocab {
+        return Err(VoxError::ShapeMismatch {
+            expected: vec![vocab],
+            actual: vec![usage_len],
+        });
+    }
+
+    let min_usage = Tensor::full(1e-5f32, cluster_usage.shape(), cluster_usage.device())?;
+    let usage = cluster_usage.maximum(&min_usage)?.reshape((vocab, 1))?;
+    let embedding = embedding_sum.broadcast_div(&usage)?;
+    if embedding.dim(1)? != dim {
+        return Err(VoxError::ShapeMismatch {
+            expected: vec![vocab, dim],
+            actual: embedding.dims().to_vec(),
+        });
+    }
+    Ok(embedding)
+}
+
+/// Load normalized codebook embeddings from weight store for the decoder quantizer.
 ///
-/// Returns Vec of 16 tensors (1 for rvq_first + 15 for rvq_rest), each [2048, 256]
+/// The tokenizer stores EMA codebook state as `embedding_sum` and `cluster_usage`.
+/// Upstream reconstructs the real lookup table as:
+/// `embedding_sum / cluster_usage.clamp(min=1e-5)[:, None]`.
 pub fn load_decoder_codebooks(store: &WeightStore) -> VoxResult<Vec<Tensor>> {
     let mut codebooks = Vec::with_capacity(16);
 
     // rvq_first (semantic, 1 layer)
     let first_key = "decoder.quantizer.rvq_first.vq.layers.0._codebook.embedding_sum";
-    let first_emb = store.require(first_key)?.clone();
+    let first_usage_key = "decoder.quantizer.rvq_first.vq.layers.0._codebook.cluster_usage";
+    let first_emb = normalized_codebook_embedding(store, first_key, first_usage_key)?;
     codebooks.push(first_emb);
 
     // rvq_rest (acoustic, 15 layers)
     for i in 0..15 {
         let key = format!("decoder.quantizer.rvq_rest.vq.layers.{i}._codebook.embedding_sum");
-        let emb = store.require(&key)?.clone();
+        let usage_key = format!("decoder.quantizer.rvq_rest.vq.layers.{i}._codebook.cluster_usage");
+        let emb = normalized_codebook_embedding(store, &key, &usage_key)?;
         codebooks.push(emb);
     }
 
