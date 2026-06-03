@@ -47,6 +47,12 @@ Latest validation:
     `out\rust_release_cuda_sample64.wav`.
   - Release CUDA sample: 24 kHz, 122880 samples, 5.12s, RMS about `-17.35 dB`,
     0 clipped samples.
+- CLI improvement pass:
+  - Added `--seed` for reproducible sampling.
+  - Added `--speed` for lightweight post-decode duration scaling.
+  - Documented the default `weights/hf_original` directory structure.
+  - Documented current generation speed limits: one-shot CLI weight loading,
+    manual Candle attention, and per-frame/per-residual incremental generation.
 - `python tools\generate_official_reference.py --help` succeeds.
 - `cargo check -p qwen-vox-cli --features cuda` succeeds without warnings.
 - Rust CLI can now dump generated codec frames before decode via
@@ -204,6 +210,8 @@ Latest validation:
    - `dist\qwen-vox-cuda.exe`
 4. CUDA is the practical runtime for the full model; CPU is packaged for
    completeness and pure-Rust portability.
+5. Next performance milestone: keep a loaded model process alive for repeated
+   requests and profile/replace manual attention with fused CUDA kernels.
 
 ## Next Suggested Command Checks
 

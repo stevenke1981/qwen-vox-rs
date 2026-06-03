@@ -4,7 +4,8 @@
 //! filtering, and categorical sampling — matching the upstream Qwen3-TTS
 //! `generation_config.json` parameters.
 
-use rand::Rng;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 
 /// Configuration for logits processing and sampling.
 #[derive(Debug, Clone)]
@@ -19,6 +20,8 @@ pub struct SamplingConfig {
     pub top_p: f32,
     /// Repetition penalty (>1.0 penalizes repeated tokens). 1.0 = disabled.
     pub repetition_penalty: f32,
+    /// Optional RNG seed for reproducible sampling.
+    pub seed: Option<u64>,
 }
 
 impl Default for SamplingConfig {
@@ -30,6 +33,7 @@ impl Default for SamplingConfig {
             top_k: 50,
             top_p: 1.0,
             repetition_penalty: 1.05,
+            seed: None,
         }
     }
 }
@@ -43,6 +47,7 @@ impl SamplingConfig {
             top_k: 0,
             top_p: 1.0,
             repetition_penalty: 1.0,
+            seed: None,
         }
     }
 }
@@ -57,6 +62,17 @@ impl SamplingConfig {
 /// # Returns
 /// Sampled token index.
 pub fn sample_token(logits: &[f32], config: &SamplingConfig, history: &[u16]) -> u16 {
+    let mut rng = rng_from_seed(config.seed);
+    sample_token_with_rng(logits, config, history, &mut rng)
+}
+
+/// Process logits and sample a token index using a caller-owned RNG.
+pub fn sample_token_with_rng<R: Rng + ?Sized>(
+    logits: &[f32],
+    config: &SamplingConfig,
+    history: &[u16],
+    rng: &mut R,
+) -> u16 {
     if !config.do_sample {
         return argmax(logits) as u16;
     }
@@ -87,7 +103,15 @@ pub fn sample_token(logits: &[f32], config: &SamplingConfig, history: &[u16]) ->
     }
 
     // 5. Softmax + categorical sampling
-    sample_categorical(&processed)
+    sample_categorical(&processed, rng)
+}
+
+/// Build a deterministic RNG when a seed is provided, otherwise use OS entropy.
+pub fn rng_from_seed(seed: Option<u64>) -> StdRng {
+    match seed {
+        Some(seed) => StdRng::seed_from_u64(seed),
+        None => StdRng::from_entropy(),
+    }
 }
 
 /// Simple argmax over a slice. Returns the FIRST index of the maximum value
@@ -188,7 +212,7 @@ fn apply_top_p(logits: &mut [f32], top_p: f32) {
 
 /// Sample from a categorical distribution defined by logits.
 /// Uses softmax to convert logits to probabilities, then samples.
-fn sample_categorical(logits: &[f32]) -> u16 {
+fn sample_categorical<R: Rng + ?Sized>(logits: &[f32], rng: &mut R) -> u16 {
     let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
 
     // Softmax
@@ -202,8 +226,6 @@ fn sample_categorical(logits: &[f32]) -> u16 {
 
     let probs: Vec<f32> = exps.iter().map(|&e| e / sum).collect();
 
-    // Sample
-    let mut rng = rand::thread_rng();
     let r: f32 = rng.gen();
 
     let mut cumsum = 0.0f32;
@@ -234,6 +256,25 @@ mod tests {
         let logits = [1.0, 5.0, 3.0, 2.0, 4.0];
         let history = vec![];
         assert_eq!(sample_token(&logits, &config, &history), 1);
+    }
+
+    #[test]
+    fn seeded_sampling_is_reproducible() {
+        let logits = [1.0, 5.0, 3.0, 2.0, 4.0];
+        let config = SamplingConfig {
+            seed: Some(42),
+            ..SamplingConfig::default()
+        };
+        let history = vec![];
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        let mut rng1 = rng_from_seed(config.seed);
+        let mut rng2 = rng_from_seed(config.seed);
+        for _ in 0..16 {
+            first.push(sample_token_with_rng(&logits, &config, &history, &mut rng1));
+            second.push(sample_token_with_rng(&logits, &config, &history, &mut rng2));
+        }
+        assert_eq!(first, second);
     }
 
     #[test]
@@ -283,5 +324,6 @@ mod tests {
         assert_eq!(config.top_k, 50);
         assert!((config.top_p - 1.0).abs() < 1e-6);
         assert!((config.repetition_penalty - 1.05).abs() < 1e-6);
+        assert_eq!(config.seed, None);
     }
 }

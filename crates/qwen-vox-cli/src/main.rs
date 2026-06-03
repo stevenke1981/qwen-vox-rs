@@ -109,6 +109,14 @@ enum Commands {
         #[arg(long, default_value_t = 1.05)]
         repetition_penalty: f32,
 
+        /// RNG seed for reproducible sampling. Omit for non-deterministic sampling.
+        #[arg(long)]
+        seed: Option<u64>,
+
+        /// Output speech speed multiplier. 1.0 = original, 1.2 = faster, 0.8 = slower.
+        #[arg(long, default_value_t = 1.0)]
+        speed: f32,
+
         /// Speaker for Qwen3-TTS CustomVoice model (e.g. vivian, serena, uncle_fu,
         /// dylan, eric for Chinese; ryan, aiden for English; ono_anna for Japanese;
         /// sohee for Korean). Default: vivian.
@@ -171,6 +179,8 @@ fn main() -> Result<()> {
             top_k,
             top_p,
             repetition_penalty,
+            seed,
+            speed,
             speaker,
         } => {
             // Parse and validate device early.
@@ -189,7 +199,9 @@ fn main() -> Result<()> {
             );
 
             let sampling_config = if temperature <= 0.0 {
-                SamplingConfig::argmax()
+                let mut config = SamplingConfig::argmax();
+                config.seed = seed;
+                config
             } else {
                 SamplingConfig {
                     do_sample: true,
@@ -197,16 +209,22 @@ fn main() -> Result<()> {
                     top_k,
                     top_p,
                     repetition_penalty,
+                    seed,
                 }
             };
             tracing::info!(
-                "Sampling: do_sample={}, temperature={}, top_k={}, top_p={}, repetition_penalty={}",
+                "Sampling: do_sample={}, temperature={}, top_k={}, top_p={}, repetition_penalty={}, seed={}",
                 sampling_config.do_sample,
                 sampling_config.temperature,
                 sampling_config.top_k,
                 sampling_config.top_p,
-                sampling_config.repetition_penalty
+                sampling_config.repetition_penalty,
+                sampling_config.seed.map(|v| v.to_string()).unwrap_or_else(|| "none".into())
             );
+            if !(0.25..=4.0).contains(&speed) {
+                anyhow::bail!("--speed must be between 0.25 and 4.0, got {speed}");
+            }
+            tracing::info!("Output speed multiplier: {speed}");
 
             let speaker_id = speaker_id(&speaker, &language)
                 .with_context(|| format!("failed to resolve speaker '{speaker}'"))?;
@@ -238,6 +256,7 @@ fn main() -> Result<()> {
                 dump_codec_frames.as_ref(),
                 &sampling_config,
                 speaker_id,
+                speed,
             )
             .with_context(|| {
                 format!(
@@ -348,6 +367,7 @@ fn generate_qwen3_tts(
     dump_codec_frames: Option<&PathBuf>,
     sampling_config: &SamplingConfig,
     speaker_id: Option<u32>,
+    speed: f32,
 ) -> Result<()> {
     let started = Instant::now();
     if text.trim().is_empty() {
@@ -422,7 +442,7 @@ fn generate_qwen3_tts(
         .decode_frame_codes(&frames)
         .context("Qwen3-TTS codec decoder failed")?;
     tracing::info!("Decoded waveform in {:.2?}", started.elapsed());
-    write_tensor_wav(output, TOKENIZER_SAMPLE_RATE, &waveform)?;
+    write_tensor_wav_with_speed(output, TOKENIZER_SAMPLE_RATE, &waveform, speed)?;
     Ok(())
 }
 
@@ -579,13 +599,46 @@ fn write_tensor_wav(
     sample_rate: u32,
     waveform: &candle_core::Tensor,
 ) -> Result<()> {
+    write_tensor_wav_with_speed(path, sample_rate, waveform, 1.0)
+}
+
+fn write_tensor_wav_with_speed(
+    path: &PathBuf,
+    sample_rate: u32,
+    waveform: &candle_core::Tensor,
+    speed: f32,
+) -> Result<()> {
     let mut flat = waveform
         .flatten_all()
         .context("failed to flatten waveform tensor")?
         .to_vec1::<f32>()
         .context("failed to extract waveform samples")?;
+    if (speed - 1.0).abs() > 1e-4 {
+        flat = stretch_waveform_speed(&flat, speed);
+    }
     normalize_waveform_for_wav(&mut flat);
     write_wav(path, sample_rate, &flat)
+}
+
+fn stretch_waveform_speed(samples: &[f32], speed: f32) -> Vec<f32> {
+    if samples.len() < 2 || (speed - 1.0).abs() <= 1e-4 {
+        return samples.to_vec();
+    }
+    let out_len = ((samples.len() as f32) / speed).round().max(1.0) as usize;
+    if out_len == 1 {
+        return vec![samples[0]];
+    }
+
+    let mut out = Vec::with_capacity(out_len);
+    for i in 0..out_len {
+        let src_pos = (i as f32) * speed;
+        let left = src_pos.floor() as usize;
+        let right = (left + 1).min(samples.len() - 1);
+        let frac = src_pos - left as f32;
+        let value = samples[left.min(samples.len() - 1)] * (1.0 - frac) + samples[right] * frac;
+        out.push(value);
+    }
+    out
 }
 
 fn write_wav(path: &PathBuf, sample_rate: u32, samples: &[f32]) -> Result<()> {
@@ -793,6 +846,14 @@ mod tests {
         let mut samples: Vec<f32> = vec![];
         normalize_waveform_for_wav(&mut samples);
         assert!(samples.is_empty());
+    }
+
+    #[test]
+    fn speed_stretch_changes_length() {
+        let samples = vec![0.0, 1.0, 0.0, -1.0, 0.0, 1.0, 0.0, -1.0];
+        assert_eq!(stretch_waveform_speed(&samples, 2.0).len(), 4);
+        assert_eq!(stretch_waveform_speed(&samples, 0.5).len(), 16);
+        assert_eq!(stretch_waveform_speed(&samples, 1.0).len(), samples.len());
     }
 
     #[test]

@@ -55,6 +55,8 @@ Run the CUDA binary:
   --device cuda `
   --language chinese `
   --speaker vivian `
+  --seed 42 `
+  --speed 1.0 `
   --text "你好，這是 Qwen3 TTS 產生的語音。" `
   --output out\speech.wav
 ```
@@ -66,12 +68,24 @@ Run the CPU binary:
   --device cpu `
   --language chinese `
   --speaker vivian `
+  --seed 42 `
   --text "你好，這是 Qwen3 TTS 產生的語音。" `
   --output out\speech-cpu.wav
 ```
 
 CPU generation works as a pure Rust path, but the full 1.7B Qwen3-TTS model is
 slow on CPU. CUDA is recommended for practical generation.
+
+Useful generation options:
+
+- `--seed 42`: makes sampling reproducible for the same text, speaker, language,
+  and sampling options. `--temperature 0` uses argmax and is deterministic even
+  without a seed.
+- `--speed 1.2`: shortens the decoded waveform for faster speech. Values below
+  `1.0` slow the output down. Current implementation is a lightweight
+  post-decode duration scale, not a pitch-preserving neural prosody control.
+- `--max-frames 96`: caps generated codec frames. Higher values allow longer
+  speech but increase generation time.
 
 ## Current Generation Path
 
@@ -94,13 +108,41 @@ This means:
 
 Large `.safetensors`, `.pt`, `.bin`, `weights/`, and `models/` paths are ignored by Git. Keep downloaded or converted model assets locally under `weights/` or `models/`.
 
-The current CLI expects local files such as:
+Default CLI paths expect this local structure:
 
-- `weights/hf_original/model.safetensors`
-- `weights/hf_original/speech_tokenizer/model.safetensors`
-- `weights/hf_original/tokenizer_config.json`
-- `weights/hf_original/vocab.json`
-- `weights/hf_original/merges.txt`
+```text
+weights/
+  hf_original/
+    model.safetensors
+    tokenizer.json
+    tokenizer_config.json
+    vocab.json
+    merges.txt
+    speech_tokenizer/
+      model.safetensors
+```
+
+The Rust tokenizer can load either `tokenizer.json` or the Hugging Face
+directory files, but keep `vocab.json`, `merges.txt`, and
+`tokenizer_config.json` with the model directory for parity diagnostics.
+
+## Performance Notes
+
+The current CLI is a one-shot process: every `generate` invocation loads the
+talker weights and speech tokenizer weights before generation. That startup cost
+is visible in short runs. The generation kernel is also a straightforward Candle
+implementation with manual attention and per-frame/per-residual incremental
+steps; it is correct enough for audible speech, but it is not yet optimized to
+match fused CUDA implementations.
+
+Next performance work:
+
+- Keep a long-lived model process/server so repeated requests reuse loaded
+  weights.
+- Replace manual attention paths with fused attention where available.
+- Reduce per-residual allocation and JSON/debug overhead in normal generation.
+- Profile 96-frame CUDA generation separately for load time vs token generation
+  time.
 
 ## Validation
 

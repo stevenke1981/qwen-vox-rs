@@ -29,7 +29,7 @@
 
 use crate::custom_ops::causal_mask;
 use crate::error::{VoxError, VoxResult};
-use crate::sampling::{sample_token, SamplingConfig};
+use crate::sampling::{rng_from_seed, sample_token_with_rng, SamplingConfig};
 use crate::transformer::{RmsNorm, TransformerBlock, TransformerCache, TransformerStack};
 use crate::weights::WeightStore;
 use candle_core::{Device, Tensor};
@@ -326,6 +326,7 @@ impl Talker {
         hidden: &Tensor,
         config: &SamplingConfig,
         q0_history: &[u16],
+        rng: &mut impl rand::Rng,
     ) -> VoxResult<(u16, Vec<u16>)> {
         // Last position: [B, 2048]
         let last = hidden.narrow(1, hidden.dim(1)? - 1, 1)?.squeeze(1)?;
@@ -340,7 +341,7 @@ impl Talker {
         if q0_history.is_empty() {
             dump_q0_topk_from_env(&q0_logits_vec)?;
         }
-        let q0_idx = sample_token(&q0_logits_vec, config, q0_history);
+        let q0_idx = sample_token_with_rng(&q0_logits_vec, config, q0_history, rng);
 
         // ── q1..q15 via code predictor (autoregressive) ──
         // Helper: small_to_mtp 2048 → 1024, returns [B, 1, 1024] for transformer input
@@ -377,7 +378,7 @@ impl Talker {
             let logits_f32 = logits.squeeze(0)?.to_dtype(candle_core::DType::F32)?;
             let logits_vec = logits_f32.to_vec1::<f32>()?;
             dump_residual_topk_from_env(q0_history.len(), g + 1, &logits_vec)?;
-            let idx = sample_token(&logits_vec, &residual_config, &[]);
+            let idx = sample_token_with_rng(&logits_vec, &residual_config, &[], rng);
             codes.push(idx);
 
             if g + 1 < NUM_RESIDUAL_CODES {
@@ -424,6 +425,7 @@ impl Talker {
         let mut input_hidden = text_hidden;
         let mut frames: Vec<[u16; 16]> = Vec::with_capacity(max_frames.min(512));
         let mut q0_history: Vec<u16> = Vec::with_capacity(max_frames.min(512));
+        let mut rng = rng_from_seed(config.seed);
 
         for _step in 0..max_frames {
             // Backbone forward: [1, T, 2048] → [1, T, 2048]
@@ -432,7 +434,8 @@ impl Talker {
                 .map_err(|e| VoxError::Inference(format!("backbone forward: {e}")))?;
 
             // Predict codes from last position
-            let (q0, residual_codes) = self.predict_codes(&hidden, config, &q0_history)?;
+            let (q0, residual_codes) =
+                self.predict_codes(&hidden, config, &q0_history, &mut rng)?;
 
             // Assemble the 16-code frame
             let mut frame = [0u16; 16];
@@ -547,8 +550,10 @@ impl Talker {
 
         let mut frames = Vec::with_capacity(max_frames.min(512));
         let mut q0_history: Vec<u16> = Vec::with_capacity(max_frames.min(512));
+        let mut rng = rng_from_seed(config.seed);
         for step in 0..max_frames {
-            let (q0, residual_codes) = self.predict_codes(&hidden, config, &q0_history)?;
+            let (q0, residual_codes) =
+                self.predict_codes(&hidden, config, &q0_history, &mut rng)?;
 
             let mut frame = [0u16; 16];
             frame[0] = q0;
@@ -1110,7 +1115,10 @@ mod tests {
         // Create dummy hidden state [1, 5, 2048]
         let hidden = Tensor::zeros((1, 5, HIDDEN), DType::F32, &device).unwrap();
         let config = SamplingConfig::argmax();
-        let (q0, residual) = talker.predict_codes(&hidden, &config, &[]).unwrap();
+        let mut rng = rng_from_seed(config.seed);
+        let (q0, residual) = talker
+            .predict_codes(&hidden, &config, &[], &mut rng)
+            .unwrap();
 
         // With all-zero weights, argmax returns 0
         assert_eq!(q0, 0, "q0 should be 0 with zero-initialized weights");
