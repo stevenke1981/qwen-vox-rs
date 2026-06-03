@@ -20,6 +20,7 @@ pub mod mtp;
 pub mod pipeline;
 
 pub mod quantizer;
+pub mod sampling;
 pub mod speaker_encoder;
 pub mod speech_synth;
 pub mod stream;

@@ -29,6 +29,7 @@
 
 use crate::custom_ops::causal_mask;
 use crate::error::{VoxError, VoxResult};
+use crate::sampling::{argmax, sample_token, SamplingConfig};
 use crate::transformer::{RmsNorm, TransformerBlock, TransformerCache, TransformerStack};
 use crate::weights::WeightStore;
 use candle_core::{Device, Tensor};
@@ -305,8 +306,24 @@ impl Talker {
     /// `hidden`: `[B, T, 2048]` — entire sequence hidden states.
     /// Uses `hidden[last]` to predict the next frame.
     ///
+    /// `config`: sampling configuration (temperature, top-k, top-p, repetition penalty).
+    /// `q0_history`: previously generated q0 tokens (for repetition penalty).
+    ///
     /// Returns `(q0, residual_codes)` where residual_codes has 15 entries.
-    fn predict_codes(&self, hidden: &Tensor) -> VoxResult<(u16, Vec<u16>)> {
+    ///
+    /// Code Predictor architecture (autoregressive, 15 steps):
+    /// - Prefill pos=0: `cp_h = small_to_mtp(last_hidden)` (2048 -> 1024)
+    /// - Prefill pos=1: `cp_h = small_to_mtp(codec_emb[q0])` (2048 -> 1024)
+    /// - For g = 1..15:
+    ///   - input = `small_to_mtp(cp_codec_emb[g-1][q_{g-1}])` (2048 -> 1024)
+    ///   - output = cp_transformer(input) at last position
+    ///   - q_g = argmax(cp_lm_heads[g-1] @ output)
+    fn predict_codes(
+        &self,
+        hidden: &Tensor,
+        config: &SamplingConfig,
+        q0_history: &[u16],
+    ) -> VoxResult<(u16, Vec<u16>)> {
         // Last position: [B, 2048]
         let last = hidden.narrow(1, hidden.dim(1)? - 1, 1)?.squeeze(1)?;
 
@@ -314,27 +331,60 @@ impl Talker {
         // last: [B, 2048], codec_head: [3072, 2048]
         let q0_logits = last.broadcast_matmul(&self.codec_head.t()?)?; // [B, 3072]
         let q0_logits = q0_logits.narrow(1, 0, CODEBOOK_SIZE)?; // [B, 2048]
-        let q0_idx = q0_logits.argmax(1)?.squeeze(0)?.to_scalar::<u32>()? as u16;
+                                                                // Convert to F32 (candle matmul on CUDA may keep BF16); sampling needs f32 slice.
+        let q0_logits_f32 = q0_logits.squeeze(0)?.to_dtype(candle_core::DType::F32)?;
+        let q0_logits_vec = q0_logits_f32.to_vec1::<f32>()?;
+        let q0_idx = sample_token(&q0_logits_vec, config, q0_history);
 
-        // ── q1..q15 via code predictor ──
-        // small_to_mtp: project from 2048 → 1024
-        let cp_h = last.broadcast_matmul(&self.small_to_mtp_w.t()?)?; // [B, 1024]
-        let cp_h = cp_h.broadcast_add(&self.small_to_mtp_b)?;
+        // ── q1..q15 via code predictor (autoregressive) ──
+        // Helper: small_to_mtp 2048 → 1024, returns [B, 1, 1024] for transformer input
+        let project = |x: &Tensor| -> VoxResult<Tensor> {
+            let y = x.broadcast_matmul(&self.small_to_mtp_w.t()?)?;
+            let y = y.broadcast_add(&self.small_to_mtp_b)?;
+            Ok(y.unsqueeze(0)?) // [1, 1, 1024] (squeeze later when needed)
+        };
 
-        // Unsqueeze to [B, 1, 1024] for transformer
-        let cp_h = cp_h.unsqueeze(1)?;
+        // ── Prefill 2 positions ──
+        // pos=0: talker hidden (projected)
+        let cp_pre_0 = project(&last)?; // [1, 1, 1024]
+                                        // pos=1: q0 embedding from TALKER codec_embedding (also 2048-dim, projected)
+        let q0_emb = self.embed_code_token(q0_idx as u32)?; // [1, 1, 2048]
+        let q0_emb_2d = q0_emb.squeeze(0)?; // [1, 2048]
+        let cp_pre_1 = project(&q0_emb_2d)?; // [1, 1, 1024]
 
-        // 5-layer code predictor transformer
-        let cp_out = self.cp_transformer.forward(&cp_h, None)?; // [B, 1, 1024]
-        let cp_last = cp_out.squeeze(1)?; // [B, 1024]
+        // Autoregressive loop: at iteration g (0..14), build seq of length (g+2):
+        //   [cp_pre_0, cp_pre_1, emb(q1), emb(q2), ..., emb(q_g)]
+        // Run CP transformer, read out last position, apply lm_head[g] → q_{g+1}.
+        let mut codes: Vec<u16> = Vec::with_capacity(NUM_RESIDUAL_CODES);
+        let mut history: Vec<u16> = vec![q0_idx]; // history[0] = q0, history[1] = q1, ...
 
-        // 15 lm_heads → argmax
-        let mut codes = Vec::with_capacity(NUM_RESIDUAL_CODES);
-        for head in &self.cp_lm_heads {
-            // head: [2048, 1024]; cp_last: [B, 1024]
-            let logits = cp_last.broadcast_matmul(&head.t()?)?; // [B, 2048]
-            let idx = logits.argmax(1)?.squeeze(0)?.to_scalar::<u32>()? as u16;
+        for g in 0..NUM_RESIDUAL_CODES {
+            let mut seq_parts: Vec<Tensor> = Vec::with_capacity(2 + g);
+            seq_parts.push(cp_pre_0.clone());
+            seq_parts.push(cp_pre_1.clone());
+            for (i, &q_i) in history.iter().enumerate().take(g + 1).skip(1) {
+                let emb = self.embed_residual_code(i - 1, q_i as u32)?; // [1, 1, 2048]
+                let emb_2d = emb.squeeze(0)?; // [1, 2048]
+                seq_parts.push(project(&emb_2d)?); // [1, 1, 1024]
+            }
+            let seq_refs: Vec<&Tensor> = seq_parts.iter().collect();
+            let seq = Tensor::cat(&seq_refs, 1)?; // [1, g+2, 1024]
+
+            // Run CP transformer (no cache — just full forward; max 17 tokens is cheap)
+            let cp_out = self
+                .cp_transformer
+                .forward(&seq, None)
+                .map_err(|e| VoxError::Inference(format!("cp forward g={g}: {e}")))?;
+            let cp_last = cp_out.narrow(1, g + 1, 1)?.squeeze(1)?; // [1, 1024]
+
+            // Apply lm_head[g]: [2048, 1024]
+            let head = &self.cp_lm_heads[g];
+            let logits = cp_last.broadcast_matmul(&head.t()?)?; // [1, 2048]
+            let logits_f32 = logits.squeeze(0)?.to_dtype(candle_core::DType::F32)?;
+            let logits_vec = logits_f32.to_vec1::<f32>()?;
+            let idx = argmax(&logits_vec) as u16;
             codes.push(idx);
+            history.push(idx);
         }
 
         Ok((q0_idx, codes))
@@ -347,10 +397,16 @@ impl Talker {
     /// # Arguments
     /// * `phone_tokens` — phone/semantic token IDs (BOS should already be prepended)
     /// * `max_frames` — maximum number of code frames to generate
+    /// * `config` — sampling configuration (use `SamplingConfig::argmax()` for deterministic)
     ///
     /// # Returns
     /// `Vec<[u16; 16]>` — sequence of (q0, q1, ..., q15) code frames.
-    pub fn generate(&self, phone_tokens: &[u32], max_frames: usize) -> VoxResult<Vec<[u16; 16]>> {
+    pub fn generate(
+        &self,
+        phone_tokens: &[u32],
+        max_frames: usize,
+        config: &SamplingConfig,
+    ) -> VoxResult<Vec<[u16; 16]>> {
         if phone_tokens.is_empty() {
             return Err(VoxError::Inference("phone_tokens must not be empty".into()));
         }
@@ -362,6 +418,7 @@ impl Talker {
         // As we generate, we append q0 code embeddings.
         let mut input_hidden = text_hidden;
         let mut frames: Vec<[u16; 16]> = Vec::with_capacity(max_frames.min(512));
+        let mut q0_history: Vec<u16> = Vec::with_capacity(max_frames.min(512));
 
         for _step in 0..max_frames {
             // Backbone forward: [1, T, 2048] → [1, T, 2048]
@@ -370,7 +427,7 @@ impl Talker {
                 .map_err(|e| VoxError::Inference(format!("backbone forward: {e}")))?;
 
             // Predict codes from last position
-            let (q0, residual_codes) = self.predict_codes(&hidden)?;
+            let (q0, residual_codes) = self.predict_codes(&hidden, config, &q0_history)?;
 
             // Assemble the 16-code frame
             let mut frame = [0u16; 16];
@@ -379,6 +436,7 @@ impl Talker {
                 frame[i + 1] = rc;
             }
             frames.push(frame);
+            q0_history.push(q0);
 
             // Check for EOS
             if q0 as u32 == CODEC_EOS {
@@ -399,11 +457,15 @@ impl Talker {
     /// `input_tokens` should be the ChatML-style text prompt used by the
     /// official pipeline:
     /// `<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n`.
+    ///
+    /// `config` controls sampling behavior (temperature, top-k, top-p, repetition penalty).
     pub fn generate_qwen3_base(
         &self,
         input_tokens: &[u32],
         language_id: Option<u32>,
+        speaker_id: Option<u32>,
         max_frames: usize,
+        config: &SamplingConfig,
     ) -> VoxResult<Vec<[u16; 16]>> {
         if input_tokens.len() < 9 {
             return Err(VoxError::Inference(
@@ -415,10 +477,18 @@ impl Talker {
         let tts_eos_embed = self.encode_text(&[TTS_EOS])?;
         let tts_pad_embed = self.encode_text(&[TTS_PAD])?;
 
+        // Codec prefill (matches mlx-audio reference):
+        //   [codec_think_id, codec_think_bos_id, language_id, codec_think_eos_id, <speaker_id?>, codec_pad_id, codec_bos_id]
+        // For the CustomVoice model the speaker token is REQUIRED between
+        // codec_think_eos_id and codec_pad_id; without it the model has no voice
+        // identity and produces high-frequency noise instead of speech.
         let mut codec_prefill = match language_id {
             Some(id) => vec![2154, 2156, id, 2157],
             None => vec![2155, 2156, 2157],
         };
+        if let Some(spk) = speaker_id {
+            codec_prefill.push(spk);
+        }
         codec_prefill.push(2148);
         codec_prefill.push(2149);
 
@@ -457,8 +527,9 @@ impl Talker {
             .map_err(|e| VoxError::Inference(format!("backbone prefill: {e}")))?;
 
         let mut frames = Vec::with_capacity(max_frames.min(512));
+        let mut q0_history: Vec<u16> = Vec::with_capacity(max_frames.min(512));
         for step in 0..max_frames {
-            let (q0, residual_codes) = self.predict_codes(&hidden)?;
+            let (q0, residual_codes) = self.predict_codes(&hidden, config, &q0_history)?;
 
             let mut frame = [0u16; 16];
             frame[0] = q0;
@@ -466,6 +537,7 @@ impl Talker {
                 frame[i + 1] = rc;
             }
             frames.push(frame);
+            q0_history.push(q0);
 
             if q0 as u32 == CODEC_EOS {
                 break;
@@ -904,7 +976,8 @@ mod tests {
 
         // Create dummy hidden state [1, 5, 2048]
         let hidden = Tensor::zeros((1, 5, HIDDEN), DType::F32, &device).unwrap();
-        let (q0, residual) = talker.predict_codes(&hidden).unwrap();
+        let config = SamplingConfig::argmax();
+        let (q0, residual) = talker.predict_codes(&hidden, &config, &[]).unwrap();
 
         // With all-zero weights, argmax returns 0
         assert_eq!(q0, 0, "q0 should be 0 with zero-initialized weights");
@@ -921,7 +994,8 @@ mod tests {
         let talker = build_minimal_talker(&device);
 
         let tokens = vec![TTS_BOS, 42, TTS_EOS];
-        let frames = talker.generate(&tokens, 5).unwrap();
+        let config = SamplingConfig::argmax();
+        let frames = talker.generate(&tokens, 5, &config).unwrap();
 
         // Should produce at least 1 frame
         assert!(!frames.is_empty(), "should generate at least one frame");

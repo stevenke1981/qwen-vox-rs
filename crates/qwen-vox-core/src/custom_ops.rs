@@ -8,6 +8,14 @@
 
 use candle_core::{Result, Tensor};
 
+fn cast_like(tensor: &Tensor, like: &Tensor) -> Result<Tensor> {
+    if tensor.dtype() == like.dtype() {
+        Ok(tensor.clone())
+    } else {
+        tensor.to_dtype(like.dtype())
+    }
+}
+
 // ── SnakeBeta Activation ──────────────────────────────────────────────────
 
 /// SnakeBeta activation: `y = x + beta * sin^2(alpha * x)`
@@ -21,8 +29,10 @@ use candle_core::{Result, Tensor};
 /// * `beta` - Amplitude parameter, shape `[channels]`
 pub fn snake_beta(x: &Tensor, alpha: &Tensor, beta: &Tensor) -> Result<Tensor> {
     // sin^2(z) = (1 - cos(2z)) / 2  — numerically more stable
-    let two = Tensor::new(&[2.0f32], x.device())?;
-    let one = Tensor::new(&[1.0f32], x.device())?;
+    let two = Tensor::new(&[2.0f32], x.device())?.to_dtype(x.dtype())?;
+    let one = Tensor::new(&[1.0f32], x.device())?.to_dtype(x.dtype())?;
+    let alpha = cast_like(alpha, x)?;
+    let beta = cast_like(beta, x)?;
 
     // alpha * x
     let ax = x.broadcast_mul(&alpha.unsqueeze(0)?)?;
@@ -53,6 +63,7 @@ pub fn snake_beta(x: &Tensor, alpha: &Tensor, beta: &Tensor) -> Result<Tensor> {
 /// * `x` - Input tensor
 /// * `gamma` - Scale parameter, shape `[channels]`
 pub fn layer_scale(x: &Tensor, gamma: &Tensor) -> Result<Tensor> {
+    let gamma = cast_like(gamma, x)?;
     x.broadcast_mul(&gamma.unsqueeze(0)?)
 }
 
@@ -66,6 +77,7 @@ pub fn layer_scale_3d(x: &Tensor, gamma: &Tensor, channel_dim: usize) -> Result<
         return layer_scale(x, gamma);
     }
     let (_d0, _d1, _d2) = x.dims3()?;
+    let gamma = cast_like(gamma, x)?;
     let gamma = match channel_dim {
         1 => gamma.reshape((1, gamma.dim(0)?, 1))?,
         2 => gamma.reshape((1, 1, gamma.dim(0)?))?,
@@ -217,11 +229,12 @@ pub fn grouped_query_attention(
     let attn_weights = q.matmul(&k_t)?;
 
     // Scale
-    let scale_tensor = Tensor::new(&[scale as f32], q.device())?;
+    let scale_tensor = Tensor::new(&[scale as f32], q.device())?.to_dtype(attn_weights.dtype())?;
     let attn_weights = attn_weights.broadcast_mul(&scale_tensor)?;
 
     // Apply mask
     let attn_weights = if let Some(m) = mask {
+        let m = cast_like(m, &attn_weights)?;
         attn_weights.broadcast_add(&m.unsqueeze(0)?.unsqueeze(0)?)?
     } else {
         attn_weights

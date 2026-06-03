@@ -489,14 +489,19 @@ impl TtsPipeline {
     ///
     /// # Returns
     /// `[1, 1, samples]` f32 waveform tensor clamped to `[-1, 1]`.
-    pub fn synthesize(&self, phone_tokens: &[u32], max_frames: usize) -> VoxResult<Tensor> {
+    pub fn synthesize(
+        &self,
+        phone_tokens: &[u32],
+        max_frames: usize,
+        config: &crate::sampling::SamplingConfig,
+    ) -> VoxResult<Tensor> {
         let talker = self
             .talker
             .as_ref()
             .ok_or_else(|| VoxError::Inference("Talker not attached. Use with_talker().".into()))?;
 
         // 1. Talker autoregressive generation: Vec<[q0..q15; 16]>
-        let frames = talker.generate(phone_tokens, max_frames)?;
+        let frames = talker.generate(phone_tokens, max_frames, config)?;
         if frames.is_empty() {
             return Err(VoxError::Inference("Talker generated zero frames".into()));
         }

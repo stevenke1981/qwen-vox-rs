@@ -38,6 +38,7 @@ hound = "3.5"
 
 # Numeric
 half = "2"
+rand = "0.8"
 
 # CLI
 clap = { version = "4", features = ["derive"] }

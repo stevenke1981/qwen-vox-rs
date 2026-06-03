@@ -3,8 +3,7 @@
 //! Loads converted weights from SafeTensors format into Candle tensors.
 
 use crate::error::{VoxError, VoxResult};
-use candle_core::{Device, Tensor};
-use safetensors::SafeTensors;
+use candle_core::{safetensors::Load, Device, Tensor};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -33,69 +32,14 @@ impl WeightStore {
     /// Load weights from a SafeTensors file.
     pub fn from_file(path: impl AsRef<Path>, device: &Device) -> VoxResult<Self> {
         let path = path.as_ref();
-        let data = std::fs::read(path)
-            .map_err(|e| VoxError::WeightLoad(format!("failed to read {}: {e}", path.display())))?;
-
-        let st = SafeTensors::deserialize(&data)
-            .map_err(|e| VoxError::WeightLoad(format!("failed to parse safetensors: {e}")))?;
-
+        let st = unsafe { candle_core::safetensors::MmapedSafetensors::new(path) }
+            .map_err(|e| VoxError::WeightLoad(format!("failed to mmap {}: {e}", path.display())))?;
         let mut tensors = HashMap::new();
 
         for (name, view) in st.tensors() {
-            let shape = view.shape().to_vec();
-            let dtype = view.dtype();
-            let data = view.data();
-
-            let tensor = match dtype {
-                safetensors::Dtype::F32 => {
-                    let floats: Vec<f32> = data
-                        .chunks_exact(4)
-                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                        .collect();
-                    Tensor::from_vec(floats, &shape[..], device)?
-                }
-                safetensors::Dtype::F16 => {
-                    let floats: Vec<f32> = data
-                        .chunks_exact(2)
-                        .map(|b| {
-                            let bits = u16::from_le_bytes([b[0], b[1]]);
-                            half::f16::from_bits(bits).to_f32()
-                        })
-                        .collect();
-                    Tensor::from_vec(floats, &shape[..], device)?
-                }
-                safetensors::Dtype::BF16 => {
-                    let floats: Vec<f32> = data
-                        .chunks_exact(2)
-                        .map(|b| {
-                            let bits = u16::from_le_bytes([b[0], b[1]]);
-                            half::bf16::from_bits(bits).to_f32()
-                        })
-                        .collect();
-                    Tensor::from_vec(floats, &shape[..], device)?
-                }
-                safetensors::Dtype::I64 => {
-                    let ints: Vec<i64> = data
-                        .chunks_exact(8)
-                        .map(|b| {
-                            i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
-                        })
-                        .collect();
-                    Tensor::from_vec(ints, &shape[..], device)?
-                }
-                safetensors::Dtype::I32 => {
-                    let ints: Vec<i32> = data
-                        .chunks_exact(4)
-                        .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                        .collect();
-                    Tensor::from_vec(ints, &shape[..], device)?
-                }
-                _ => {
-                    return Err(VoxError::WeightLoad(format!(
-                        "unsupported dtype {dtype:?} for tensor '{name}'"
-                    )));
-                }
-            };
+            let tensor = view.load(device).map_err(|e| {
+                VoxError::WeightLoad(format!("failed to load tensor '{name}': {e}"))
+            })?;
 
             tensors.insert(name.to_string(), tensor);
         }
