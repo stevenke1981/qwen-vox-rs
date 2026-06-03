@@ -674,6 +674,153 @@ impl Talker {
         Ok(frames)
     }
 
+    /// Generate codec frames with the official Qwen3-TTS Base ICL clone layout.
+    ///
+    /// `ref_tokens` must be tokenized from
+    /// `<|im_start|>assistant\n{ref_text}<|im_end|>\n`.
+    /// `ref_frames` are the reference audio codec frames `[q0..q15]` produced by
+    /// the speech tokenizer encoder.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_qwen3_base_icl_clone(
+        &self,
+        input_tokens: &[u32],
+        ref_tokens: &[u32],
+        ref_frames: &[[u16; 16]],
+        language_id: Option<u32>,
+        speaker_embedding: &Tensor,
+        max_frames: usize,
+        config: &SamplingConfig,
+    ) -> VoxResult<Vec<[u16; 16]>> {
+        if input_tokens.len() < 9 {
+            return Err(VoxError::Inference(
+                "Qwen3-TTS prompt must contain role/text/end tokens".into(),
+            ));
+        }
+        if ref_tokens.len() < 5 {
+            return Err(VoxError::Inference(
+                "Qwen3-TTS reference prompt must contain role/text/end tokens".into(),
+            ));
+        }
+        if ref_frames.is_empty() {
+            return Err(VoxError::Inference(
+                "ICL clone requires at least one reference codec frame".into(),
+            ));
+        }
+
+        let (_, hidden) = speaker_embedding.dims2().map_err(|e| {
+            VoxError::Inference(format!("speaker embedding must be [1, hidden]: {e}"))
+        })?;
+        if hidden != self.codec_embedding.dim(1)? {
+            return Err(VoxError::ShapeMismatch {
+                expected: vec![1, self.codec_embedding.dim(1)?],
+                actual: speaker_embedding.dims().to_vec(),
+            });
+        }
+
+        let tts_bos_embed = self.encode_text(&[TTS_BOS])?;
+        let tts_eos_embed = self.encode_text(&[TTS_EOS])?;
+        let tts_pad_embed = self.encode_text(&[TTS_PAD])?;
+
+        let codec_prefill_0 = match language_id {
+            Some(id) => vec![2154, 2156, id, 2157],
+            None => vec![2155, 2156, 2157],
+        };
+        let codec_prefill_1 = [2148u32, 2149u32];
+
+        let role_embed = self.encode_text(&input_tokens[..3])?;
+        let codec_embed_0 = self.embed_codec_prefill(&codec_prefill_0)?;
+        let codec_embed_1 = self.embed_codec_prefill(&codec_prefill_1)?;
+        let spk_embed = speaker_embedding
+            .to_dtype(self.codec_embedding.dtype())?
+            .unsqueeze(1)?;
+        let codec_embed = Tensor::cat(&[&codec_embed_0, &spk_embed, &codec_embed_1], 1)?;
+        let codec_len = codec_embed.dim(1)?;
+
+        let pad_count = codec_len.saturating_sub(2);
+        let mut prefill_text_parts = Vec::with_capacity(pad_count + 1);
+        for _ in 0..pad_count {
+            prefill_text_parts.push(&tts_pad_embed);
+        }
+        prefill_text_parts.push(&tts_bos_embed);
+        let text_prefill = Tensor::cat(&prefill_text_parts, 1)?;
+        let codec_without_last = codec_embed.narrow(1, 0, codec_len - 1)?;
+        let prefill_embed = text_prefill.add(&codec_without_last)?;
+
+        let ref_text_embed = self.encode_text(&ref_tokens[3..ref_tokens.len() - 2])?;
+        let target_text_embed = self.encode_text(&input_tokens[3..input_tokens.len() - 5])?;
+        let text_embed = Tensor::cat(&[&ref_text_embed, &target_text_embed, &tts_eos_embed], 1)?;
+
+        let codec_bos_embed = self.embed_codec_prefill(&[2149u32])?;
+        let mut ref_code_embeds = Vec::with_capacity(ref_frames.len() + 1);
+        ref_code_embeds.push(codec_bos_embed);
+        for frame in ref_frames {
+            ref_code_embeds.push(self.embed_codec_frame(frame)?);
+        }
+        let ref_code_refs: Vec<&Tensor> = ref_code_embeds.iter().collect();
+        let codec_icl_embed = Tensor::cat(&ref_code_refs, 1)?;
+
+        let text_lens = text_embed.dim(1)?;
+        let codec_lens = codec_icl_embed.dim(1)?;
+        let (icl_input_embed, trailing_text_hidden) = if text_lens > codec_lens {
+            (
+                text_embed.narrow(1, 0, codec_lens)?.add(&codec_icl_embed)?,
+                text_embed.narrow(1, codec_lens, text_lens - codec_lens)?,
+            )
+        } else {
+            let mut text_parts = Vec::with_capacity(codec_lens);
+            text_parts.push(text_embed);
+            for _ in 0..(codec_lens - text_lens) {
+                text_parts.push(tts_pad_embed.clone());
+            }
+            let text_refs: Vec<&Tensor> = text_parts.iter().collect();
+            (
+                Tensor::cat(&text_refs, 1)?.add(&codec_icl_embed)?,
+                tts_pad_embed.clone(),
+            )
+        };
+
+        let input_hidden = Tensor::cat(&[&role_embed, &prefill_embed, &icl_input_embed], 1)?;
+
+        let mut cache = self.backbone.empty_cache();
+        let prefill_mask = causal_mask(input_hidden.dim(1)?, input_hidden.device())?;
+        let mut hidden = self
+            .backbone_forward_cached(&input_hidden, &mut cache, Some(&prefill_mask))
+            .map_err(|e| VoxError::Inference(format!("backbone ICL prefill: {e}")))?;
+
+        let mut frames = Vec::with_capacity(max_frames.min(512));
+        let mut q0_history: Vec<u16> = Vec::with_capacity(max_frames.min(512));
+        let mut rng = rng_from_seed(config.seed);
+        for step in 0..max_frames {
+            let (q0, residual_codes) =
+                self.predict_codes(&hidden, config, &q0_history, &mut rng)?;
+
+            let mut frame = [0u16; 16];
+            frame[0] = q0;
+            for (i, &rc) in residual_codes.iter().enumerate() {
+                frame[i + 1] = rc;
+            }
+            frames.push(frame);
+            q0_history.push(q0);
+
+            if q0 as u32 == CODEC_EOS {
+                break;
+            }
+
+            let mut next_embed = self.embed_codec_frame(&frame)?;
+            let text_add = if step < trailing_text_hidden.dim(1)? {
+                trailing_text_hidden.narrow(1, step, 1)?
+            } else {
+                tts_pad_embed.clone()
+            };
+            next_embed = next_embed.add(&text_add)?;
+            hidden = self
+                .backbone_forward_cached(&next_embed, &mut cache, None)
+                .map_err(|e| VoxError::Inference(format!("backbone ICL incremental: {e}")))?;
+        }
+
+        Ok(frames)
+    }
+
     // ── Weight Loading Helpers ─────────────────────────────────────────────────
 
     /// Load one backbone transformer block (28 total).

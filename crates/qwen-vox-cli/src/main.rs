@@ -11,6 +11,7 @@ use qwen_vox_core::device::DeviceManager;
 use qwen_vox_core::pipeline::{TtsPipeline, TOKENIZER_FRAME_RATE_HZ, TOKENIZER_SAMPLE_RATE};
 use qwen_vox_core::sampling::SamplingConfig;
 use qwen_vox_core::speaker_encoder::SpeakerEncoder;
+use qwen_vox_core::speech_tokenizer_encoder::SpeechTokenizerEncoder;
 use qwen_vox_core::talker::Talker;
 use qwen_vox_core::tokenizer::Tokenizer;
 use qwen_vox_core::weights::WeightStore;
@@ -193,6 +194,10 @@ enum Commands {
         /// RNG seed for reproducible sampling. Omit for non-deterministic sampling.
         #[arg(long)]
         seed: Option<u64>,
+
+        /// Write reference audio codec frames to JSON for ICL parity debugging.
+        #[arg(long)]
+        dump_ref_codec_frames: Option<PathBuf>,
     },
 }
 
@@ -366,6 +371,7 @@ fn main() -> Result<()> {
             language,
             max_frames,
             seed,
+            dump_ref_codec_frames,
         } => clone_voice(
             &text,
             &ref_audio,
@@ -377,6 +383,7 @@ fn main() -> Result<()> {
             &language,
             max_frames,
             seed,
+            dump_ref_codec_frames.as_ref(),
         ),
     }
 }
@@ -392,6 +399,7 @@ fn clone_voice(
     language: &str,
     max_frames: usize,
     seed: Option<u64>,
+    dump_ref_codec_frames: Option<&PathBuf>,
 ) -> Result<()> {
     let started = Instant::now();
     let config_path = model_dir.join("config.json");
@@ -409,9 +417,9 @@ fn clone_voice(
     if !ref_audio.exists() {
         anyhow::bail!("reference audio does not exist: {}", ref_audio.display());
     }
-    if ref_text.map(str::trim).unwrap_or("").is_empty() {
-        anyhow::bail!("--ref-text is required for official ICL voice clone mode");
-    }
+    let ref_text = ref_text
+        .filter(|s| !s.trim().is_empty())
+        .context("ref_text is required for Qwen3-TTS ICL voice clone")?;
     if text.trim().is_empty() {
         anyhow::bail!("text must not be empty");
     }
@@ -459,21 +467,60 @@ fn clone_voice(
     let prompt_tokens = tokenizer
         .encode(&prompt)
         .with_context(|| "failed to tokenize Qwen3-TTS ChatML prompt")?;
+    let ref_prompt = qwen3_ref_prompt(ref_text);
+    let ref_tokens = tokenizer
+        .encode(&ref_prompt)
+        .with_context(|| "failed to tokenize Qwen3-TTS reference prompt")?;
+
+    let decoder_weights = model_dir.join("speech_tokenizer").join("model.safetensors");
+    let decoder_store =
+        WeightStore::from_file(&decoder_weights, dev_mgr.device()).with_context(|| {
+            format!(
+                "failed to load speech tokenizer weights {}",
+                decoder_weights.display()
+            )
+        })?;
+    let speech_encoder = SpeechTokenizerEncoder::from_store(&decoder_store)
+        .context("failed to build Qwen3-TTS speech tokenizer encoder")?;
+    let ref_audio_tensor = candle_core::Tensor::from_vec(
+        ref_samples.clone(),
+        (1, ref_samples.len()),
+        dev_mgr.device(),
+    )
+    .context("failed to create reference audio tensor")?;
+    let ref_codes = speech_encoder
+        .encode_audio_codes(&ref_audio_tensor, Some(ref_samples.len()))
+        .context("failed to encode reference audio into Qwen3-TTS codec frames")?;
+    let ref_frames = tensor_to_codec_frames(&ref_codes)
+        .context("failed to convert reference codec tensor to frames")?;
+    if ref_frames.is_empty() {
+        anyhow::bail!("reference audio encoded to zero codec frames");
+    }
+    tracing::info!(
+        "Encoded reference audio to {} ICL codec frames in {:.2?}",
+        ref_frames.len(),
+        started.elapsed()
+    );
+    if let Some(path) = dump_ref_codec_frames {
+        write_codec_frames_json(path, &ref_frames)?;
+        tracing::info!("Wrote reference codec frame dump to {}", path.display());
+    }
 
     let talker = Talker::from_store(&model_store).context("failed to build Base talker")?;
     let mut sampling_config = SamplingConfig::default();
     sampling_config.seed = seed;
     let effective_max_frames = resolve_max_frames(text, max_frames);
     let frames = talker
-        .generate_qwen3_base_with_speaker_embedding(
+        .generate_qwen3_base_icl_clone(
             &prompt_tokens,
+            &ref_tokens,
+            &ref_frames,
             language_id(language)?,
-            None,
-            Some(&speaker_embedding),
+            &speaker_embedding,
             effective_max_frames,
             &sampling_config,
         )
-        .context("Qwen3-TTS Base talker failed to generate clone codec frames")?;
+        .context("Qwen3-TTS Base talker failed to generate ICL clone codec frames")?;
     if frames.is_empty() {
         anyhow::bail!("Qwen3-TTS clone generated zero codec frames");
     }
@@ -483,20 +530,20 @@ fn clone_voice(
         started.elapsed()
     );
 
-    let decoder_weights = model_dir.join("speech_tokenizer").join("model.safetensors");
-    let decoder_store =
-        WeightStore::from_file(&decoder_weights, dev_mgr.device()).with_context(|| {
-            format!(
-                "failed to load decoder weights {}",
-                decoder_weights.display()
-            )
-        })?;
     let pipeline = TtsPipeline::from_tokenizer_weights(decoder_store)
         .context("failed to build Qwen3-TTS codec decoder")?;
+    let mut decode_frames = Vec::with_capacity(ref_frames.len() + frames.len());
+    decode_frames.extend_from_slice(&ref_frames);
+    decode_frames.extend_from_slice(&frames);
     let waveform = pipeline
-        .decode_frame_codes(&frames)
+        .decode_frame_codes(&decode_frames)
         .context("Qwen3-TTS codec decoder failed")?;
-    write_tensor_wav(output, TOKENIZER_SAMPLE_RATE, &waveform)?;
+    write_tensor_wav_skip_prefix(
+        output,
+        TOKENIZER_SAMPLE_RATE,
+        &waveform,
+        ref_frames.len() * qwen_vox_core::pipeline::TOKENIZER_DECODE_UPSAMPLE_RATE,
+    )?;
     tracing::info!(
         "Wrote cloned speech to {} in {:.2?}",
         output.display(),
@@ -688,6 +735,10 @@ fn qwen3_prompt(text: &str) -> String {
     format!("<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n")
 }
 
+fn qwen3_ref_prompt(text: &str) -> String {
+    format!("<|im_start|>assistant\n{text}<|im_end|>\n")
+}
+
 fn language_id(language: &str) -> Result<Option<u32>> {
     match language.to_ascii_lowercase().as_str() {
         "auto" => Ok(None),
@@ -793,6 +844,23 @@ fn write_tensor_wav(
     waveform: &candle_core::Tensor,
 ) -> Result<()> {
     write_tensor_wav_with_speed(path, sample_rate, waveform, 1.0)
+}
+
+fn write_tensor_wav_skip_prefix(
+    path: &PathBuf,
+    sample_rate: u32,
+    waveform: &candle_core::Tensor,
+    skip_samples: usize,
+) -> Result<()> {
+    let flat = waveform
+        .flatten_all()
+        .context("failed to flatten waveform tensor")?
+        .to_vec1::<f32>()
+        .context("failed to extract waveform samples")?;
+    let start = skip_samples.min(flat.len());
+    let mut output = flat[start..].to_vec();
+    normalize_waveform_for_wav(&mut output);
+    write_wav(path, sample_rate, &output)
 }
 
 fn write_tensor_wav_with_speed(
@@ -979,6 +1047,31 @@ fn write_codec_frames_json(path: &PathBuf, frames: &[[u16; 16]]) -> Result<()> {
     writeln!(writer, "  ]")?;
     writeln!(writer, "}}")?;
     Ok(())
+}
+
+fn tensor_to_codec_frames(tensor: &candle_core::Tensor) -> Result<Vec<[u16; 16]>> {
+    let dims = tensor.dims();
+    if dims.len() != 3 || dims[0] != 1 || dims[2] != 16 {
+        anyhow::bail!("expected codec tensor shape [1, frames, 16], got {dims:?}");
+    }
+    let frame_count = dims[1];
+    let values: Vec<u32> = tensor
+        .flatten_all()
+        .context("failed to flatten codec tensor")?
+        .to_vec1()
+        .context("failed to read codec tensor")?;
+    let mut frames = Vec::with_capacity(frame_count);
+    for chunk in values.chunks_exact(16) {
+        let mut frame = [0u16; 16];
+        for (dst, &src) in frame.iter_mut().zip(chunk) {
+            if src > u16::MAX as u32 {
+                anyhow::bail!("codec id {src} exceeds u16 range");
+            }
+            *dst = src as u16;
+        }
+        frames.push(frame);
+    }
+    Ok(frames)
 }
 
 #[derive(Deserialize)]

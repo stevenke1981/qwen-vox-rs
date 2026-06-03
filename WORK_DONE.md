@@ -271,6 +271,44 @@ Latest validation:
 5. Next performance milestone: keep a loaded model process alive for repeated
    requests and profile/replace manual attention with fused CUDA kernels.
 
+## ICL Clone Ref-Code Stage
+
+- Added the missing Rust speech-tokenizer encoder path for voice clone:
+  Mimi causal Conv/ResNet encoder -> causal/sliding Transformer -> downsample
+  -> encoder-side split RVQ.
+- Added encoder RVQ nearest-neighbor encode and official encoder codebook
+  loading from `encoder.quantizer.*.embed_sum / cluster_usage`.
+- Added `Talker::generate_qwen3_base_icl_clone`, matching the official Base
+  ICL prompt layout:
+  - target text uses assistant prompt token slice `[3:-5]`;
+  - reference text uses reference prompt token slice `[3:-2]`;
+  - reference codec prompt is `codec_bos + ref_code`;
+  - speaker embedding remains inserted in the codec prefill.
+- Updated `qwen-vox clone` to:
+  - require `--ref-text` for ICL mode;
+  - encode `--ref-audio` into `ref_code`;
+  - optionally dump reference frames with `--dump-ref-codec-frames`;
+  - decode `[ref_code + generated_code]` and cut the reference prefix, matching
+    the official clone decode strategy.
+- Verified:
+  - `cargo check -p qwen-vox-cli --features cuda`
+  - `cargo test -p qwen-vox-core quantizer`
+  - `cargo test -p qwen-vox-core speech_tokenizer_encoder`
+  - ignored real-weight speech tokenizer encoder smoke: passed with local
+    `weights/model-0.6b/speech_tokenizer/model.safetensors`
+  - CUDA ICL clone smoke:
+    `out/clone_icl_sample32.wav`, 24 kHz mono, 2.56s, mean volume -17.7 dB,
+    max volume -0.9 dB.
+  - Official tokenizer ref-code parity check:
+    `out/official_clone_ref_codes.npy` vs `out/clone_icl_ref_frames.json`
+    both have shape `59 x 16`; 909/944 code values match. First mismatch is
+    frame 9, codebook 9 (`official=1360`, `rust=1333`).
+- Known test caveat:
+  - full `cargo test -p qwen-vox-core --lib` still has 5 pre-existing
+    `talker::tests::*` minimal-fixture failures because those tests lack
+    `talker.code_predictor.model.layers.0.self_attn.q_norm.weight`; the new
+    quantizer and speech tokenizer encoder tests pass.
+
 ## Next Suggested Command Checks
 
 ```powershell
