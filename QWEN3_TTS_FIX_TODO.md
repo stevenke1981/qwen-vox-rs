@@ -53,6 +53,11 @@
     - prefill all target text plus TTS_EOS with codec PAD
     - append final `tts_pad + codec_bos`
     - use only `tts_pad_embed` as trailing text during codec-frame generation
+  - Changed residual code predictor from full unmasked re-forward to an upstream-style cached path:
+    - prefill `[past_hidden, q0_hidden]` with a causal mask
+    - generate q1 from `lm_head[0]`
+    - feed each later residual code one token at a time through the code-predictor KV cache
+    - use residual code sampling with no repetition penalty, matching upstream subtalker settings more closely
 
 - `crates/qwen-vox-core/src/pipeline.rs`
   - Enabled `rope_theta=10000` for speech tokenizer decoder pre-transformer.
@@ -66,19 +71,20 @@
   - `out/qwen3_rope_16frames.wav` completed on CUDA with `--max-frames 16`.
   - `out/qwen3_rope_eps_16frames.wav` completed on CUDA after Q/K norm epsilon alignment.
   - `out/qwen3_nonstream_16frames.wav` completed on CUDA after non-streaming prompt embedding alignment.
+  - `out/qwen3_cp_cache_16frames.wav` completed on CUDA after code-predictor cache/causal alignment.
   - 16 frames -> 30720 samples -> 1.280s at 24 kHz.
-  - latest codec frame diagnostics: code range `[11, 2046]`, unique q0 values `13/16`, repeated consecutive frames `0`.
+  - latest codec frame diagnostics: code range `[1, 2040]`, unique q0 values `11/16`, repeated consecutive frames `0`.
 - The audio is non-silent, but still sounds like high-frequency noise.
 - The remaining issue is now more likely model alignment than final WAV gain:
   - generated codec frames may be invalid
   - talker transformer may be numerically wrong
   - tokenizer decoder may still be numerically wrong for known-good frames
-- FFmpeg metrics for `out/qwen3_nonstream_16frames.wav` still look unlike normal speech:
-  - RMS level: `-2.73 dB`
+- FFmpeg metrics for `out/qwen3_cp_cache_16frames.wav` still look unlike normal speech:
+  - RMS level: `-2.71 dB`
   - max volume: `-0.9 dB`
-  - peak count: `15703`
+  - peak count: `15754`
   - crest factor: `1.23`
-  - zero crossing rate: `0.0867`
+  - zero crossing rate: `0.0872`
 
 ## Root-Cause TODO
 
@@ -100,7 +106,7 @@
    - Keep `vivian` or another official speaker as the default.
 
 3. Replace pure argmax generation if upstream uses sampling.
-   - Current `Talker::predict_codes` uses argmax for q0 and residual codes.
+   - Current `Talker::predict_codes` uses sampling for q0 and residual codes.
    - Check upstream settings for temperature, top-k, top-p, repetition penalty, EOS handling, and special token suppression.
    - Implement the exact decoding strategy before judging audio quality.
 

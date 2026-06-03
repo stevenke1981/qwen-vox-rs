@@ -29,7 +29,7 @@
 
 use crate::custom_ops::causal_mask;
 use crate::error::{VoxError, VoxResult};
-use crate::sampling::{argmax, sample_token, SamplingConfig};
+use crate::sampling::{sample_token, SamplingConfig};
 use crate::transformer::{RmsNorm, TransformerBlock, TransformerCache, TransformerStack};
 use crate::weights::WeightStore;
 use candle_core::{Device, Tensor};
@@ -313,12 +313,13 @@ impl Talker {
     /// Returns `(q0, residual_codes)` where residual_codes has 15 entries.
     ///
     /// Code Predictor architecture (autoregressive, 15 steps):
-    /// - Prefill pos=0: `cp_h = small_to_mtp(last_hidden)` (2048 -> 1024)
-    /// - Prefill pos=1: `cp_h = small_to_mtp(codec_emb[q0])` (2048 -> 1024)
+    /// - Prefill pos=0: `small_to_mtp(last_hidden)` (2048 -> 1024)
+    /// - Prefill pos=1: `small_to_mtp(codec_emb[q0])` (2048 -> 1024)
+    /// - Read `lm_head[0]` at the prefill last position to generate q1.
     /// - For g = 1..15:
-    ///   - input = `small_to_mtp(cp_codec_emb[g-1][q_{g-1}])` (2048 -> 1024)
-    ///   - output = cp_transformer(input) at last position
-    ///   - q_g = argmax(cp_lm_heads[g-1] @ output)
+    ///   - feed only the previous residual code embedding through the cached
+    ///     code predictor
+    ///   - read `lm_head[g]` to generate q_{g+1}
     fn predict_codes(
         &self,
         hidden: &Tensor,
@@ -353,39 +354,37 @@ impl Talker {
         let q0_emb_2d = q0_emb.squeeze(0)?; // [1, 2048]
         let cp_pre_1 = project(&q0_emb_2d)?; // [1, 1, 1024]
 
-        // Autoregressive loop: at iteration g (0..14), build seq of length (g+2):
-        //   [cp_pre_0, cp_pre_1, emb(q1), emb(q2), ..., emb(q_g)]
-        // Run CP transformer, read out last position, apply lm_head[g] → q_{g+1}.
         let mut codes: Vec<u16> = Vec::with_capacity(NUM_RESIDUAL_CODES);
-        let mut history: Vec<u16> = vec![q0_idx]; // history[0] = q0, history[1] = q1, ...
+        let mut residual_config = config.clone();
+        residual_config.repetition_penalty = 1.0;
+
+        let mut cp_cache = self.cp_transformer.empty_cache();
+        let cp_prefill = Tensor::cat(&[&cp_pre_0, &cp_pre_1], 1)?;
+        let cp_prefill_mask = causal_mask(cp_prefill.dim(1)?, cp_prefill.device())?;
+        let cp_out = self
+            .cp_transformer
+            .forward_with_cache(&cp_prefill, Some(&cp_prefill_mask), &mut cp_cache)
+            .map_err(|e| VoxError::Inference(format!("cp prefill: {e}")))?;
+        let mut cp_last = cp_out.narrow(1, cp_out.dim(1)? - 1, 1)?.squeeze(1)?;
 
         for g in 0..NUM_RESIDUAL_CODES {
-            let mut seq_parts: Vec<Tensor> = Vec::with_capacity(2 + g);
-            seq_parts.push(cp_pre_0.clone());
-            seq_parts.push(cp_pre_1.clone());
-            for (i, &q_i) in history.iter().enumerate().take(g + 1).skip(1) {
-                let emb = self.embed_residual_code(i - 1, q_i as u32)?; // [1, 1, 2048]
-                let emb_2d = emb.squeeze(0)?; // [1, 2048]
-                seq_parts.push(project(&emb_2d)?); // [1, 1, 1024]
-            }
-            let seq_refs: Vec<&Tensor> = seq_parts.iter().collect();
-            let seq = Tensor::cat(&seq_refs, 1)?; // [1, g+2, 1024]
-
-            // Run CP transformer (no cache — just full forward; max 17 tokens is cheap)
-            let cp_out = self
-                .cp_transformer
-                .forward(&seq, None)
-                .map_err(|e| VoxError::Inference(format!("cp forward g={g}: {e}")))?;
-            let cp_last = cp_out.narrow(1, g + 1, 1)?.squeeze(1)?; // [1, 1024]
-
-            // Apply lm_head[g]: [2048, 1024]
             let head = &self.cp_lm_heads[g];
-            let logits = cp_last.broadcast_matmul(&head.t()?)?; // [1, 2048]
+            let logits = cp_last.broadcast_matmul(&head.t()?)?;
             let logits_f32 = logits.squeeze(0)?.to_dtype(candle_core::DType::F32)?;
             let logits_vec = logits_f32.to_vec1::<f32>()?;
-            let idx = argmax(&logits_vec) as u16;
+            let idx = sample_token(&logits_vec, &residual_config, &[]);
             codes.push(idx);
-            history.push(idx);
+
+            if g + 1 < NUM_RESIDUAL_CODES {
+                let emb = self.embed_residual_code(g, idx as u32)?;
+                let emb_2d = emb.squeeze(0)?;
+                let cp_step = project(&emb_2d)?;
+                let cp_out = self
+                    .cp_transformer
+                    .forward_with_cache(&cp_step, None, &mut cp_cache)
+                    .map_err(|e| VoxError::Inference(format!("cp incremental g={g}: {e}")))?;
+                cp_last = cp_out.squeeze(1)?;
+            }
         }
 
         Ok((q0_idx, codes))
