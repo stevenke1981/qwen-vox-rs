@@ -58,6 +58,17 @@ Latest validation:
     `--seed 1234 --speed 1.25 --max-frames 16` produced identical codec-frame
     JSON and identical WAV hashes.
   - Verified `--speed 1.25` shortened the 16-frame output to 24576 samples.
+- Voice clone groundwork:
+  - Confirmed official Hugging Face wrapper only supports
+    `generate_voice_clone()` for `tts_model_type == "base"`.
+  - Confirmed `weights/hf_original` is `custom_voice` and cannot clone from
+    reference audio by official rules.
+  - Confirmed `weights/model-0.6b` is `base` and includes
+    `speaker_encoder_config`, but its talker hidden size is 1024, while the
+    current Rust `Talker` is still specialized for the 1.7B 2048-hidden model.
+  - Added `qwen-vox clone` CLI scaffolding with Base-model validation and clear
+    errors. Next step is implementing the Base speaker encoder and dynamic
+    0.6B talker loading.
 - `python tools\generate_official_reference.py --help` succeeds.
 - `cargo check -p qwen-vox-cli --features cuda` succeeds without warnings.
 - Rust CLI can now dump generated codec frames before decode via

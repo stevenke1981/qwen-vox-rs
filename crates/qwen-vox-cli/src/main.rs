@@ -13,6 +13,7 @@ use qwen_vox_core::talker::Talker;
 use qwen_vox_core::tokenizer::Tokenizer;
 use qwen_vox_core::weights::WeightStore;
 use serde::Deserialize;
+use serde_json::Value;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -146,6 +147,33 @@ enum Commands {
 
         /// Compute device: "cpu", "cuda", or "metal".
         #[arg(long, default_value = "cpu")]
+        device: String,
+    },
+
+    /// Voice-clone speech from reference audio using Qwen3-TTS Base weights.
+    Clone {
+        /// Input text to synthesize.
+        #[arg(short, long)]
+        text: String,
+
+        /// Reference 24 kHz WAV used for cloning.
+        #[arg(long)]
+        ref_audio: PathBuf,
+
+        /// Reference transcript. Required for official ICL clone mode.
+        #[arg(long)]
+        ref_text: Option<String>,
+
+        /// Output WAV file path.
+        #[arg(short, long, default_value = "clone.wav")]
+        output: PathBuf,
+
+        /// Path to Qwen3-TTS Base model directory.
+        #[arg(long, default_value = "weights/model-0.6b")]
+        model_dir: PathBuf,
+
+        /// Compute device: "cpu", "cuda", or "metal".
+        #[arg(long, default_value = "cuda")]
         device: String,
     },
 }
@@ -309,7 +337,56 @@ fn main() -> Result<()> {
             decoder_weights,
             device,
         } => decode_frames_json(&input, &output, &decoder_weights, &device),
+        Commands::Clone {
+            text,
+            ref_audio,
+            ref_text,
+            output,
+            model_dir,
+            device,
+        } => clone_voice(
+            &text,
+            &ref_audio,
+            ref_text.as_deref(),
+            &output,
+            &model_dir,
+            &device,
+        ),
     }
+}
+
+fn clone_voice(
+    text: &str,
+    ref_audio: &PathBuf,
+    ref_text: Option<&str>,
+    output: &PathBuf,
+    model_dir: &PathBuf,
+    device: &str,
+) -> Result<()> {
+    let config_path = model_dir.join("config.json");
+    let config: Value = read_json_file(&config_path)?;
+    let tts_model_type = config
+        .get("tts_model_type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if tts_model_type != "base" {
+        anyhow::bail!(
+            "voice clone requires Qwen3-TTS Base weights, but {} has tts_model_type={tts_model_type}. Official Qwen3-TTS also rejects voice cloning for CustomVoice weights.",
+            config_path.display()
+        );
+    }
+    if !ref_audio.exists() {
+        anyhow::bail!("reference audio does not exist: {}", ref_audio.display());
+    }
+    if ref_text.map(str::trim).unwrap_or("").is_empty() {
+        anyhow::bail!("--ref-text is required for official ICL voice clone mode");
+    }
+    anyhow::bail!(
+        "voice clone scaffolding is ready, but Base speaker encoder and 0.6B dynamic talker loading are not implemented yet (text='{}', output={}, device={}).",
+        text,
+        output.display(),
+        device
+    );
 }
 
 fn decode_frames_json(
@@ -765,14 +842,17 @@ enum CodecFramesJson {
 }
 
 fn read_codec_frames_json(path: &PathBuf) -> Result<Vec<[u16; 16]>> {
-    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let parsed: CodecFramesJson = serde_json::from_reader(file)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let parsed: CodecFramesJson = read_json_file(path)?;
     let frames = match parsed {
         CodecFramesJson::Wrapped { frames } => frames,
         CodecFramesJson::Raw(frames) => frames,
     };
     Ok(frames)
+}
+
+fn read_json_file<T: for<'de> Deserialize<'de>>(path: &PathBuf) -> Result<T> {
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    serde_json::from_reader(file).with_context(|| format!("failed to parse {}", path.display()))
 }
 
 #[cfg(test)]

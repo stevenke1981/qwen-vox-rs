@@ -76,6 +76,30 @@ Run the CPU binary:
 CPU generation works as a pure Rust path, but the full 1.7B Qwen3-TTS model is
 slow on CPU. CUDA is recommended for practical generation.
 
+## Voice Clone Status
+
+Official Qwen3-TTS voice cloning is a Base-model feature. The CustomVoice
+weights in `weights/hf_original` provide preset speakers such as `vivian`, but
+do not include `speaker_encoder_config`; official Hugging Face code rejects
+`generate_voice_clone()` for CustomVoice weights.
+
+This repository now exposes the clone CLI entry point and validates the model
+type:
+
+```powershell
+.\dist\qwen-vox-cuda.exe clone `
+  --model-dir weights\model-0.6b `
+  --device cuda `
+  --ref-audio reference.wav `
+  --ref-text "Reference transcript text." `
+  --text "Text to synthesize." `
+  --output out\clone.wav
+```
+
+The next implementation work is Base speaker encoder support and dynamic 0.6B
+talker loading. Until that is complete, `clone` reports an explicit error after
+validating that Base weights and reference inputs are present.
+
 Useful generation options:
 
 - `--seed 42`: makes sampling reproducible for the same text, speaker, language,
@@ -118,6 +142,13 @@ weights/
     tokenizer_config.json
     vocab.json
     merges.txt
+    speech_tokenizer/
+      model.safetensors
+  model-0.6b/
+    config.json
+    model.safetensors
+    tokenizer_config.json
+    vocab.json
     speech_tokenizer/
       model.safetensors
 ```
