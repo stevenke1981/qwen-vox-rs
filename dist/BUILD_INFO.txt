@@ -1,0 +1,8 @@
+﻿qwen-vox-rs release build
+commit=e6f89d0
+built_at_utc=2026-06-03T15:41:43Z
+cpu=dist\qwen-vox-cpu.exe
+cuda=dist\qwen-vox-cuda.exe
+
+Example:
+dist\qwen-vox-cuda.exe generate --device cuda --language chinese --speaker vivian --text "Hello from Qwen3 TTS." --output out\speech.wav

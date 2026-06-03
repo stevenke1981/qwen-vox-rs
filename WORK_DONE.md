@@ -40,6 +40,13 @@ Latest validation:
 - User listened to `out/rust_current_sample64.wav` and confirmed it is normal
   human speech.
 - `scripts\build_release.ps1` builds CPU and CUDA release binaries into `dist\`.
+- Release binaries built and smoke-tested:
+  - `dist\qwen-vox-cpu.exe --help` succeeds.
+  - `dist\qwen-vox-cuda.exe --help` succeeds.
+  - `dist\qwen-vox-cuda.exe generate ... --max-frames 64` produced
+    `out\rust_release_cuda_sample64.wav`.
+  - Release CUDA sample: 24 kHz, 122880 samples, 5.12s, RMS about `-17.35 dB`,
+    0 clipped samples.
 - `python tools\generate_official_reference.py --help` succeeds.
 - `cargo check -p qwen-vox-cli --features cuda` succeeds without warnings.
 - Rust CLI can now dump generated codec frames before decode via
