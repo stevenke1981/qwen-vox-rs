@@ -222,9 +222,10 @@ pub fn grouped_query_attention(
     // Repeat K/V heads to match Q heads (GQA expansion)
     let repeat_factor = num_heads / num_kv_heads;
     let (k_expanded, v_expanded) = if repeat_factor > 1 {
-        let k_rep = k.repeat((1, repeat_factor, 1, 1))?;
-        let v_rep = v.repeat((1, repeat_factor, 1, 1))?;
-        (k_rep, v_rep)
+        (
+            repeat_kv_heads(k, repeat_factor)?,
+            repeat_kv_heads(v, repeat_factor)?,
+        )
     } else {
         (k.clone(), v.clone())
     };
@@ -250,6 +251,19 @@ pub fn grouped_query_attention(
 
     // attn_probs · V: [batch, num_heads, seq_len, head_dim]
     attn_probs.matmul(&v_expanded)
+}
+
+fn repeat_kv_heads(x: &Tensor, repeat_factor: usize) -> Result<Tensor> {
+    let kv_heads = x.dim(1)?;
+    let mut heads = Vec::with_capacity(kv_heads * repeat_factor);
+    for head_idx in 0..kv_heads {
+        let head = x.narrow(1, head_idx, 1)?;
+        for _ in 0..repeat_factor {
+            heads.push(head.clone());
+        }
+    }
+    let refs: Vec<&Tensor> = heads.iter().collect();
+    Tensor::cat(&refs, 1)
 }
 
 #[cfg(test)]

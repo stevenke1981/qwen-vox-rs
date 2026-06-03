@@ -52,6 +52,16 @@ Latest validation:
     half-split `rotate_half`: argmax `841`, top logit `10.0`.
   - Conclusion: official half-split RoPE is required and fixed, but another
     backbone mismatch remains before q0 parity is reached.
+- GQA repeat-interleave fix:
+  - Rust previously repeated KV heads as whole-head blocks, which likely
+    produced `[0..7, 0..7]`.
+  - Official `repeat_kv` repeats each KV head contiguously:
+    `[0,0,1,1,...,7,7]`.
+  - After fixing Rust GQA repeat order, first-frame q0 top-k matches official:
+    official argmax `1995` / logit `32.25`; Rust argmax `1995` / logit
+    `32.25`.
+  - Current remaining mismatch is frame0 residual code predictor q1..q15, so
+    subsequent q0 frames diverge after the first frame.
 
 ## Completed In This Stage
 
@@ -98,6 +108,8 @@ Latest validation:
 - `crates/qwen-vox-core/src/transformer.rs`
   - Talker RoPE now uses official half-split `rotate_half` semantics instead
     of adjacent even/odd pairing.
+- `crates/qwen-vox-core/src/custom_ops.rs`
+  - GQA KV head expansion now matches official repeat-interleave semantics.
 - `crates/qwen-vox-core/src/talker.rs`
   - Adds optional first-frame q0 logits top-k dump through
     `QWEN_VOX_DUMP_Q0_TOPK`.
