@@ -12,6 +12,8 @@ use qwen_vox_core::sampling::SamplingConfig;
 use qwen_vox_core::talker::Talker;
 use qwen_vox_core::tokenizer::Tokenizer;
 use qwen_vox_core::weights::WeightStore;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -58,8 +60,8 @@ enum Commands {
         )]
         decoder_weights: PathBuf,
 
-        /// Path to tokenizer.json.
-        #[arg(long, default_value = "tokenizer.json")]
+        /// Path to tokenizer.json or an official HF tokenizer directory.
+        #[arg(long, default_value = "weights/hf_original")]
         tokenizer: PathBuf,
 
         /// Compute device: "cpu", "cuda", or "metal".
@@ -77,6 +79,10 @@ enum Commands {
         /// Print first N codec frames for debugging generation quality.
         #[arg(long, default_value_t = 0)]
         debug_frames: usize,
+
+        /// Write generated codec frames to a JSON file before waveform decoding.
+        #[arg(long)]
+        dump_codec_frames: Option<PathBuf>,
 
         /// Sampling temperature (lower = more deterministic). Use 0 for argmax.
         #[arg(long, default_value_t = 0.9)]
@@ -127,6 +133,7 @@ fn main() -> Result<()> {
             language,
             max_frames,
             debug_frames,
+            dump_codec_frames,
             temperature,
             top_k,
             top_p,
@@ -188,6 +195,7 @@ fn main() -> Result<()> {
                 &language,
                 effective_max_frames,
                 debug_frames,
+                dump_codec_frames.as_ref(),
                 &sampling_config,
                 speaker_id,
             )
@@ -250,6 +258,7 @@ fn generate_qwen3_tts(
     language: &str,
     max_frames: usize,
     debug_frames: usize,
+    dump_codec_frames: Option<&PathBuf>,
     sampling_config: &SamplingConfig,
     speaker_id: Option<u32>,
 ) -> Result<()> {
@@ -315,6 +324,11 @@ fn generate_qwen3_tts(
 
     if debug_frames > 0 {
         log_codec_frames(&frames, debug_frames);
+    }
+
+    if let Some(path) = dump_codec_frames {
+        write_codec_frames_json(path, &frames)?;
+        tracing::info!("Wrote codec frame dump to {}", path.display());
     }
 
     let waveform = pipeline
@@ -567,6 +581,40 @@ fn log_codec_frames(frames: &[[u16; 16]], max_log: usize) {
             "  ⚠ Only {unique_q0} unique q0 values across {total} frames — generation may be stuck"
         );
     }
+}
+
+fn write_codec_frames_json(path: &PathBuf, frames: &[[u16; 16]]) -> Result<()> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let file =
+        File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    writeln!(writer, "{{")?;
+    writeln!(writer, "  \"format\": \"qwen-vox-codec-frames-v1\",")?;
+    writeln!(writer, "  \"frame_rate_hz\": {TOKENIZER_FRAME_RATE_HZ},")?;
+    writeln!(writer, "  \"codebooks\": 16,")?;
+    writeln!(writer, "  \"frame_count\": {},", frames.len())?;
+    writeln!(writer, "  \"frames\": [")?;
+    for (i, frame) in frames.iter().enumerate() {
+        write!(writer, "    [")?;
+        for (j, code) in frame.iter().enumerate() {
+            if j > 0 {
+                write!(writer, ", ")?;
+            }
+            write!(writer, "{code}")?;
+        }
+        if i + 1 == frames.len() {
+            writeln!(writer, "]")?;
+        } else {
+            writeln!(writer, "],")?;
+        }
+    }
+    writeln!(writer, "  ]")?;
+    writeln!(writer, "}}")?;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -11,6 +11,7 @@
 
 use crate::error::{VoxError, VoxResult};
 use serde::Deserialize;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -117,6 +118,8 @@ pub struct Tokenizer {
     merge_rules: Vec<MergeRule>,
     /// Merge rank lookup: (left, right) → rank.
     merge_rank: HashMap<(String, String), usize>,
+    /// Added special tokens that must be matched before byte-level BPE.
+    added_tokens: Vec<(String, u32)>,
     /// GPT-2 byte-to-character mapping for encode pre-tokenization.
     byte_to_char: HashMap<u8, char>,
     /// Inverse: character → byte for decode post-processing.
@@ -127,12 +130,96 @@ impl Tokenizer {
     /// Load tokenizer from a `tokenizer.json` file.
     pub fn from_file(path: impl AsRef<Path>) -> VoxResult<Self> {
         let path = path.as_ref();
+        if path.is_dir() {
+            return Self::from_hf_dir(path);
+        }
+
         let content = std::fs::read_to_string(path)
             .map_err(|e| VoxError::Tokenizer(format!("failed to read {}: {e}", path.display())))?;
 
-        let config: TokenizerConfig = serde_json::from_str(&content)
+        let mut config: TokenizerConfig = serde_json::from_str(&content)
             .map_err(|e| VoxError::Tokenizer(format!("failed to parse tokenizer.json: {e}")))?;
+        let added_tokens = Self::load_added_tokens_from_json(&content)?;
+        for (token, id) in &added_tokens {
+            config.vocab.entry(token.clone()).or_insert(*id);
+        }
+        Self::from_config(config, added_tokens)
+    }
 
+    fn from_hf_dir(path: &Path) -> VoxResult<Self> {
+        let vocab_path = path.join("vocab.json");
+        let merges_path = path.join("merges.txt");
+        let tokenizer_config_path = path.join("tokenizer_config.json");
+
+        let vocab_content = std::fs::read_to_string(&vocab_path).map_err(|e| {
+            VoxError::Tokenizer(format!("failed to read {}: {e}", vocab_path.display()))
+        })?;
+        let mut vocab: HashMap<String, u32> = serde_json::from_str(&vocab_content)
+            .map_err(|e| VoxError::Tokenizer(format!("failed to parse vocab.json: {e}")))?;
+
+        let merges_content = std::fs::read_to_string(&merges_path).map_err(|e| {
+            VoxError::Tokenizer(format!("failed to read {}: {e}", merges_path.display()))
+        })?;
+        let merges = merges_content
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(str::to_string)
+            .collect();
+
+        let added_tokens = if tokenizer_config_path.exists() {
+            let tokenizer_config =
+                std::fs::read_to_string(&tokenizer_config_path).map_err(|e| {
+                    VoxError::Tokenizer(format!(
+                        "failed to read {}: {e}",
+                        tokenizer_config_path.display()
+                    ))
+                })?;
+            Self::load_added_tokens_from_json(&tokenizer_config)?
+        } else {
+            Vec::new()
+        };
+        for (token, id) in &added_tokens {
+            vocab.entry(token.clone()).or_insert(*id);
+        }
+
+        Self::from_config(
+            TokenizerConfig {
+                model_type: "BPE".to_string(),
+                vocab,
+                merges,
+                special_tokens: None,
+            },
+            added_tokens,
+        )
+    }
+
+    fn load_added_tokens_from_json(content: &str) -> VoxResult<Vec<(String, u32)>> {
+        let value: Value = serde_json::from_str(content)
+            .map_err(|e| VoxError::Tokenizer(format!("failed to parse tokenizer metadata: {e}")))?;
+        let Some(decoder) = value
+            .get("added_tokens_decoder")
+            .and_then(|v| v.as_object())
+        else {
+            return Ok(Vec::new());
+        };
+
+        let mut tokens = Vec::with_capacity(decoder.len());
+        for (id, token) in decoder {
+            let id = id
+                .parse::<u32>()
+                .map_err(|e| VoxError::Tokenizer(format!("invalid added token id {id}: {e}")))?;
+            let content = token
+                .get("content")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| VoxError::Tokenizer(format!("missing content for token {id}")))?;
+            tokens.push((content.to_string(), id));
+        }
+        tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
+        Ok(tokens)
+    }
+
+    fn from_config(config: TokenizerConfig, added_tokens: Vec<(String, u32)>) -> VoxResult<Self> {
         // Build reverse vocabulary
         let id_to_token: HashMap<u32, String> =
             config.vocab.iter().map(|(k, &v)| (v, k.clone())).collect();
@@ -172,6 +259,7 @@ impl Tokenizer {
             id_to_token,
             merge_rules,
             merge_rank,
+            added_tokens,
             byte_to_char,
             char_to_byte,
         })
@@ -184,6 +272,53 @@ impl Tokenizer {
     /// 3. Look up each character in the vocabulary to form initial tokens.
     /// 4. Apply BPE merges until no more applicable.
     pub fn encode(&self, text: &str) -> VoxResult<Vec<u32>> {
+        let mut ids = Vec::new();
+        let mut pos = 0usize;
+
+        while pos < text.len() {
+            if let Some((token, id)) = self.match_added_token_at(text, pos) {
+                ids.push(id);
+                pos += token.len();
+                continue;
+            }
+
+            let next_special = self.find_next_added_token(text, pos).unwrap_or(text.len());
+            ids.extend(self.encode_regular(&text[pos..next_special])?);
+            pos = next_special;
+        }
+
+        if ids.is_empty() && !text.is_empty() {
+            return Err(VoxError::Tokenizer(format!(
+                "no tokens found for input: '{text}'"
+            )));
+        }
+
+        Ok(ids)
+    }
+
+    fn match_added_token_at<'a>(&'a self, text: &str, pos: usize) -> Option<(&'a str, u32)> {
+        self.added_tokens
+            .iter()
+            .find(|(token, _)| text[pos..].starts_with(token))
+            .map(|(token, id)| (token.as_str(), *id))
+    }
+
+    fn find_next_added_token(&self, text: &str, pos: usize) -> Option<usize> {
+        self.added_tokens
+            .iter()
+            .filter_map(|(token, _)| text[pos..].find(token).map(|offset| pos + offset))
+            .min()
+    }
+
+    fn encode_regular(&self, text: &str) -> VoxResult<Vec<u32>> {
+        let mut ids = Vec::new();
+        for piece in pretokenize(text) {
+            ids.extend(self.encode_bpe_piece(&piece)?);
+        }
+        Ok(ids)
+    }
+
+    fn encode_bpe_piece(&self, text: &str) -> VoxResult<Vec<u32>> {
         // Step 1 & 2: convert text to UTF-8 bytes, then to byte-level characters
         let initial_chars: String = text
             .as_bytes()
@@ -220,15 +355,12 @@ impl Tokenizer {
         }
 
         // Convert tokens to IDs
-        let ids: Vec<u32> = tokens
-            .iter()
-            .filter_map(|t| self.config.vocab.get(t).copied())
-            .collect();
-
-        if ids.is_empty() && !text.is_empty() {
-            return Err(VoxError::Tokenizer(format!(
-                "no tokens found for input: '{text}'"
-            )));
+        let mut ids = Vec::with_capacity(tokens.len());
+        for token in &tokens {
+            let id = self.config.vocab.get(token).copied().ok_or_else(|| {
+                VoxError::Tokenizer(format!("token '{token}' not found for input: '{text}'"))
+            })?;
+            ids.push(id);
         }
 
         Ok(ids)
@@ -287,6 +419,82 @@ impl Tokenizer {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PretokenKind {
+    Alpha,
+    Digit,
+    Cjk,
+    Other,
+}
+
+fn pretoken_kind(ch: char) -> PretokenKind {
+    if ch.is_ascii_alphabetic() {
+        PretokenKind::Alpha
+    } else if ch.is_ascii_digit() {
+        PretokenKind::Digit
+    } else if is_cjk(ch) {
+        PretokenKind::Cjk
+    } else {
+        PretokenKind::Other
+    }
+}
+
+fn is_cjk(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xF900..=0xFAFF
+            | 0x20000..=0x2A6DF
+            | 0x2A700..=0x2B73F
+            | 0x2B740..=0x2B81F
+            | 0x2B820..=0x2CEAF
+    )
+}
+
+fn pretokenize(text: &str) -> Vec<String> {
+    let mut pieces = Vec::new();
+    let mut pending_space = String::new();
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == ' ' || ch == '\t' {
+            pending_space.push(ch);
+            continue;
+        }
+
+        if ch.is_whitespace() {
+            if !pending_space.is_empty() {
+                pieces.push(std::mem::take(&mut pending_space));
+            }
+            pieces.push(ch.to_string());
+            continue;
+        }
+
+        let kind = pretoken_kind(ch);
+        let mut piece = std::mem::take(&mut pending_space);
+        piece.push(ch);
+
+        if kind != PretokenKind::Other {
+            while let Some(&next) = chars.peek() {
+                if next.is_whitespace() || pretoken_kind(next) != kind {
+                    break;
+                }
+                piece.push(next);
+                chars.next();
+            }
+        }
+
+        pieces.push(piece);
+    }
+
+    if !pending_space.is_empty() {
+        pieces.push(pending_space);
+    }
+
+    pieces
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,6 +542,7 @@ mod tests {
             id_to_token: HashMap::new(),
             merge_rules: Vec::new(),
             merge_rank: HashMap::new(),
+            added_tokens: Vec::new(),
             byte_to_char,
             char_to_byte,
         };
@@ -343,5 +552,24 @@ mod tests {
         assert_eq!(tokenizer.special_token("codec_think"), Some(102));
         assert_eq!(tokenizer.special_token("codec_nothink"), Some(103));
         assert_eq!(tokenizer.special_token("unknown"), None);
+    }
+
+    #[test]
+    fn test_qwen3_official_prompt_token_ids() {
+        let weights_dir = Path::new("weights/hf_original");
+        if !weights_dir.exists() {
+            return;
+        }
+
+        let tokenizer = Tokenizer::from_file(weights_dir).unwrap();
+        let prompt = "<|im_start|>assistant\n你好，這是官方 Qwen3 TTS 參考語音。<|im_end|>\n<|im_start|>assistant\n";
+        let ids = tokenizer.encode(prompt).unwrap();
+        assert_eq!(
+            ids,
+            vec![
+                151644, 77091, 198, 108386, 3837, 107304, 100777, 1207, 16948, 18, 350, 9951,
+                26853, 225, 77598, 102819, 78685, 1773, 151645, 198, 151644, 77091, 198,
+            ]
+        );
     }
 }

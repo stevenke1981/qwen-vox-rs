@@ -149,6 +149,7 @@ def main() -> int:
     parser.add_argument("--source-dir", default="out")
     parser.add_argument("--output", default="out/official_qwen3_reference.wav")
     parser.add_argument("--codes-output", default="")
+    parser.add_argument("--argmax", action="store_true")
     parser.add_argument("--cpu", action="store_true")
     args = parser.parse_args()
 
@@ -197,6 +198,28 @@ def main() -> int:
         }
     )
 
+    if args.argmax:
+        generation_kwargs = {
+            "max_new_tokens": args.max_new_tokens,
+            "do_sample": False,
+            "subtalker_dosample": False,
+            "repetition_penalty": 1.0,
+        }
+    else:
+        generation_kwargs = {
+            "max_new_tokens": args.max_new_tokens,
+            "do_sample": True,
+            "top_k": 50,
+            "top_p": 1.0,
+            "temperature": 0.9,
+            "subtalker_dosample": True,
+            "subtalker_top_k": 50,
+            "subtalker_top_p": 1.0,
+            "subtalker_temperature": 0.9,
+            "repetition_penalty": 1.05,
+        }
+    print({"generation": generation_kwargs})
+
     with torch.inference_mode():
         talker_codes_list, _ = model.generate(
             input_ids=input_ids,
@@ -204,16 +227,7 @@ def main() -> int:
             languages=[args.language],
             speakers=[args.speaker],
             non_streaming_mode=True,
-            max_new_tokens=args.max_new_tokens,
-            do_sample=True,
-            top_k=50,
-            top_p=1.0,
-            temperature=0.9,
-            subtalker_dosample=True,
-            subtalker_top_k=50,
-            subtalker_top_p=1.0,
-            subtalker_temperature=0.9,
-            repetition_penalty=1.05,
+            **generation_kwargs,
         )
 
     print({"generated_frames": [tuple(c.shape) for c in talker_codes_list]})

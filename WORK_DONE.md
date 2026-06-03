@@ -32,6 +32,11 @@ Latest validation:
 
 - `python tools\generate_official_reference.py --help` succeeds.
 - `cargo check -p qwen-vox-cli --features cuda` succeeds without warnings.
+- Rust CLI can now dump generated codec frames before decode via
+  `--dump-codec-frames`.
+- Rust tokenizer now loads the official HF tokenizer directory
+  `weights/hf_original` and matches the verified official prompt token IDs:
+  23 tokens for `<|im_start|>assistant\n你好，這是官方 Qwen3 TTS 參考語音。...`.
 
 ## Completed In This Stage
 
@@ -68,6 +73,13 @@ Latest validation:
   - PyTorch intermediate export support.
 - `tools/generate_official_reference.py`
   - Reusable upstream Python reference generator for verified human-voice WAVs and optional codec-frame `.npy` dumps.
+  - Supports `--argmax` for deterministic frame parity runs.
+- `tools/compare_codec_frames.py`
+  - Compares official `.npy` codec frames against Rust JSON frame dumps.
+- `crates/qwen-vox-cli/src/main.rs`
+  - Adds `--dump-codec-frames` and defaults tokenizer loading to `weights/hf_original`.
+- `crates/qwen-vox-core/src/tokenizer.rs`
+  - Loads official HF tokenizer directories, merges added special tokens, and preserves ChatML special tokens before BPE.
 - `OFFICIAL_QWEN3_TTS_REFERENCE_FLOW.md`
   - Complete official flow record and Rust rewrite target order.
 - `plan.md`
@@ -97,4 +109,7 @@ cargo check -p qwen-vox-cli --features cuda
 cargo test -p qwen-vox-core test_decoder_only_pipeline_with_test_input -- --nocapture
 cargo run -p qwen-vox-cli --features cuda -- generate --device cuda --language chinese --speaker vivian --text "你好，這是一段語音測試。" --max-frames 32 --debug-frames 8 --output out\qwen3_next_cli_check.wav
 python tools\generate_official_reference.py --text "你好，這是官方 Qwen3 TTS 參考語音。" --language chinese --speaker vivian --max-new-tokens 64 --output out\official_qwen3_reference.wav --codes-output out\official_qwen3_reference_codes.npy
+cargo run -p qwen-vox-cli --features cuda --bin qwen-vox -- generate --device cuda --language chinese --speaker vivian --text "你好，這是官方 Qwen3 TTS 參考語音。" --max-frames 16 --temperature 0 --dump-codec-frames out\rust_official_prompt_argmax16_frames.json --output out\rust_official_prompt_argmax16.wav
+python tools\generate_official_reference.py --text "你好，這是官方 Qwen3 TTS 參考語音。" --language chinese --speaker vivian --max-new-tokens 16 --argmax --output out\official_qwen3_reference_argmax16.wav --codes-output out\official_qwen3_reference_argmax16_codes.npy
+python tools\compare_codec_frames.py --official out\official_qwen3_reference_argmax16_codes.npy --rust out\rust_official_prompt_argmax16_frames.json --show 8
 ```
