@@ -225,21 +225,24 @@ pub struct DecoderBlock {
 }
 
 impl DecoderBlock {
-    /// Load one decoder block (block_idx = 1..=4) from ComponentWeights (prefix "decoder").
+    /// Load one decoder block (block_idx = 1..=4) from ComponentWeights (using official full key prefixes).
     pub fn from_weights(weights: &ComponentWeights, block_idx: usize) -> VoxResult<Self> {
         let snake_alpha = weights
-            .require(&format!("decoder.{}.block.0.alpha", block_idx))?
+            .require(&format!("decoder.decoder.{}.block.0.alpha", block_idx))?
             .clone();
         let snake_beta = weights
-            .require(&format!("decoder.{}.block.0.beta", block_idx))?
+            .require(&format!("decoder.decoder.{}.block.0.beta", block_idx))?
             .clone();
 
         let ct_w = weights
-            .require(&format!("decoder.{}.block.1.conv.weight", block_idx))?
+            .require(&format!(
+                "decoder.decoder.{}.block.1.conv.weight",
+                block_idx
+            ))?
             .clone();
         let ct_b = Some(
             weights
-                .require(&format!("decoder.{}.block.1.conv.bias", block_idx))?
+                .require(&format!("decoder.decoder.{}.block.1.conv.bias", block_idx))?
                 .clone(),
         );
         let upsample_rate = DECODER_UPSAMPLE_RATES
@@ -252,41 +255,53 @@ impl DecoderBlock {
         let dilations = [1, 3, 9];
         for (r, &dil) in (2..=4).zip(dilations.iter()) {
             let a1a = weights
-                .require(&format!("decoder.{}.block.{}.act1.alpha", block_idx, r))?
+                .require(&format!(
+                    "decoder.decoder.{}.block.{}.act1.alpha",
+                    block_idx, r
+                ))?
                 .clone();
             let a1b = weights
-                .require(&format!("decoder.{}.block.{}.act1.beta", block_idx, r))?
+                .require(&format!(
+                    "decoder.decoder.{}.block.{}.act1.beta",
+                    block_idx, r
+                ))?
                 .clone();
             let a2a = weights
-                .require(&format!("decoder.{}.block.{}.act2.alpha", block_idx, r))?
+                .require(&format!(
+                    "decoder.decoder.{}.block.{}.act2.alpha",
+                    block_idx, r
+                ))?
                 .clone();
             let a2b = weights
-                .require(&format!("decoder.{}.block.{}.act2.beta", block_idx, r))?
+                .require(&format!(
+                    "decoder.decoder.{}.block.{}.act2.beta",
+                    block_idx, r
+                ))?
                 .clone();
             let c1w = weights
                 .require(&format!(
-                    "decoder.{}.block.{}.conv1.conv.weight",
+                    "decoder.decoder.{}.block.{}.conv1.conv.weight",
                     block_idx, r
                 ))?
                 .clone();
             let c1b = Some(
                 weights
                     .require(&format!(
-                        "decoder.{}.block.{}.conv1.conv.bias",
+                        "decoder.decoder.{}.block.{}.conv1.conv.bias",
                         block_idx, r
                     ))?
                     .clone(),
             );
             let c2w = weights
                 .require(&format!(
-                    "decoder.{}.block.{}.conv2.conv.weight",
+                    "decoder.decoder.{}.block.{}.conv2.conv.weight",
                     block_idx, r
                 ))?
                 .clone();
             let c2b = Some(
                 weights
                     .require(&format!(
-                        "decoder.{}.block.{}.conv2.conv.bias",
+                        "decoder.decoder.{}.block.{}.conv2.conv.bias",
                         block_idx, r
                     ))?
                     .clone(),
@@ -323,16 +338,16 @@ pub struct TokenizerDecoder {
 }
 
 impl TokenizerDecoder {
-    /// Load from ComponentWeights with prefix "decoder".
-    /// Expects keys:
-    ///   decoder.0.conv.{weight,bias}          (the post-transformer projection conv)
-    ///   decoder.{1..4}.block.*                (4 up blocks)
-    ///   decoder.5.{alpha,beta}                (final snake)
-    ///   decoder.6.conv.{weight,bias}          (final conv to 1 channel)
+    /// Load from ComponentWeights (with empty prefix, using official PyTorch key names directly).
+    /// Expects keys (official prefixes):
+    ///   decoder.decoder.0.conv.{weight,bias}          (the post-transformer projection conv)
+    ///   decoder.decoder.{1..4}.block.*                (4 up blocks)
+    ///   decoder.decoder.5.{alpha,beta}                (final snake)
+    ///   decoder.decoder.6.conv.{weight,bias}          (final conv to 1 channel)
     pub fn from_weights(weights: &ComponentWeights) -> VoxResult<Self> {
-        // decoder.0.conv acts as the "pre" projection right after transformer output
-        let pc_w = weights.require("decoder.0.conv.weight")?.clone();
-        let pc_b = Some(weights.require("decoder.0.conv.bias")?.clone());
+        // decoder.decoder.0.conv acts as the "pre" projection right after transformer output
+        let pc_w = weights.require("decoder.decoder.0.conv.weight")?.clone();
+        let pc_b = Some(weights.require("decoder.decoder.0.conv.bias")?.clone());
         let pre_conv = CausalConv1dLayer::from_weights(pc_w, pc_b, 1, 1, 1)?;
 
         let mut decoder_blocks = Vec::with_capacity(4);
@@ -340,11 +355,11 @@ impl TokenizerDecoder {
             decoder_blocks.push(DecoderBlock::from_weights(weights, i)?);
         }
 
-        let fsa = weights.require("decoder.5.alpha")?.clone();
-        let fsb = weights.require("decoder.5.beta")?.clone();
+        let fsa = weights.require("decoder.decoder.5.alpha")?.clone();
+        let fsb = weights.require("decoder.decoder.5.beta")?.clone();
 
-        let fc_w = weights.require("decoder.6.conv.weight")?.clone();
-        let fc_b = Some(weights.require("decoder.6.conv.bias")?.clone());
+        let fc_w = weights.require("decoder.decoder.6.conv.weight")?.clone();
+        let fc_b = Some(weights.require("decoder.decoder.6.conv.bias")?.clone());
         let final_conv = CausalConv1dLayer::from_weights(fc_w, fc_b, 1, 1, 1)?;
 
         Ok(Self {

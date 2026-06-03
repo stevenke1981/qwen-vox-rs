@@ -1,18 +1,32 @@
 # Qwen3-TTS Rust Rewrite — Technical Specification
 
-> **Version**: 1.0.0  
+> **Version**: 1.1.0  
 > **Created**: 2026-06  
+> **Updated**: 2026-06-03 (official HF verification)  
 > **Status**: Draft  
-> **Scope**: Codec Decode module — Python/PyTorch → pure Rust port
+> **Scope**: Codec Decode module for **Qwen3-TTS-Tokenizer-12Hz** (official name; actual rate 12.5 Hz) — Python/PyTorch → pure Rust port using Candle.
+
+**Official Reference** (verified via Hugging Face):
+- Model: `Qwen/Qwen3-TTS-Tokenizer-12Hz`
+- Paper: Qwen3-TTS Technical Report (arXiv 2601.15621)
+- Key facts:
+  - Marketed as "12Hz" / "Qwen3-TTS-Tokenizer-12Hz".
+  - **Actual operating rate: 12.5 Hz** (80 ms per frame, 1920 samples @ 24 kHz).
+  - 16-layer multi-codebook (1 semantic + 15 acoustic RVQ).
+  - Decoder: lightweight **causal ConvNet** (no DiT for this tokenizer; DiT/flow-matching is for the separate 25 Hz tokenizer).
+  - Enables ultra-low first-packet latency (~97 ms end-to-end in full system).
+
+**Note on naming confusion**: Some internal docs (e.g. copied from other ports) refer to "Decoder12Hz". This is the **same component** as the official 12Hz tokenizer's causal decoder. The "12" vs "12.5" difference is marketing vs precise rate; the current implementation correctly uses 12.5 Hz (see `TOKENIZER_FRAME_RATE_HZ`).
 
 ---
 
 ## 1. Project Overview
 
-Port the **Qwen3-TTS Codec Decode** module from Python/PyTorch to pure Rust. The rewritten module must support dual-mode decoding:
+Port the **Qwen3-TTS-Tokenizer-12Hz Codec Decoder** (the causal ConvNet path) from Python/PyTorch to pure Rust (Candle).
 
-- **12 Hz** — real-time interactive (causal convolution, ≤97 ms first packet)
-- **25 Hz** — high-quality synthesis (block-wise flow matching DiT, ≤300 ms first packet)
+This is the low-latency streaming tokenizer (distinct from the 25 Hz tokenizer which uses block-wise DiT + flow matching for higher quality).
+
+Target latency (full system context): first packet ≤ 97 ms.
 
 Core engineering challenges:
 1. Multi-codebook parallel processing (16 quantizer layers)
@@ -42,12 +56,16 @@ Core engineering challenges:
 
 ## 3. Core Functional Specifications
 
-### 3.1 Dual-Mode Tokenizer Decoding
+### 3.1 Tokenizer Decoding (Qwen3-TTS-Tokenizer-12Hz focus)
 
-| Mode | Tokenizer | Decoder Architecture | Latency Target | Key Characteristics |
-|---|---|---|---|---|
-| Real-time Interactive | 12 Hz | Causal ConvNet + MTP | First packet ≤ 97 ms | 16-layer independent codebook parallel, zero look-ahead |
-| High-quality Synthesis | 25 Hz | Block-wise Flow Matching DiT | First packet ≤ 300 ms | Single-stage token prediction, chunked diffusion |
+This project targets the **official Qwen3-TTS-Tokenizer-12Hz** codec decoder (causal ConvNet path).
+
+| Tokenizer (Official) | Marketing Name | Actual Rate | Decoder Architecture (this port) | Notes |
+|---|----|----|----|----|
+| Qwen3-TTS-Tokenizer-12Hz | 12Hz | **12.5 Hz** (80 ms/frame) | RVQ (16 codebooks) → pre_conv → 8-layer pre_transformer (GQA) → 2× upsample → 4-block causal SEANet-style conv decoder (dilations 1,3,9) + final Snake+Conv | Lightweight causal ConvNet, full left-context streaming, 1920× total upsample to 24 kHz |
+| Qwen3-TTS-Tokenizer-25Hz | 25Hz | 25 Hz | Single-codebook + block-wise DiT + flow matching (BigVGAN vocoder) | **Not in current scope** of this codec-decoder port |
+
+The old "dual Decoder12Hz / Decoder25Hz" view in earlier drafts was a misunderstanding from mixing ports. The two tokenizers are separate models on HF; their decoders are architecturally different. This spec and the `CodecDecoder` / `pipeline.rs` implement the 12Hz causal path.
 
 ### 3.2 Multi-Codebook Processing (12 Hz Mode)
 
@@ -116,58 +134,97 @@ pub trait TtsDecoder: Send + Sync {
 | macOS | ARM64 | Metal |
 | Windows | x86_64 | CUDA / CPU |
 
----
-
-## 5. Acceptance Criteria
-
-1. **12 Hz mode** — continuous 10-second audio generation, first-packet latency **P99 ≤ 97 ms**.
-2. **25 Hz mode** — generated audio PESQ score deviation from Python reference **≤ 0.05**.
-3. **Regression suite** — 1000 variable-length text end-to-end tests: **zero crashes, zero silent segments**.
-4. **Test suite** — `cargo test --release` passes 100%, including numerical-alignment unit tests.
+**Current focus**: 12Hz causal ConvNet decoder (the path used by Qwen3-TTS-12Hz models for low-latency streaming). The 25 Hz DiT path is a separate tokenizer and is not the target of the current `CodecDecoder` implementation.
 
 ---
 
-## 6. Architecture Overview (Preliminary)
+## 5. Acceptance Criteria (for 12Hz Tokenizer Decoder)
+
+1. **Qwen3-TTS-Tokenizer-12Hz (12.5 Hz) causal decode** — 8-frame batch decode produces correct-length 24 kHz waveform (1920 samples/frame). Layer-wise cosine similarity vs PyTorch reference **≥ 0.999** on key stages (RVQ out, pre_conv, pre_transformer, upsample, decoder blocks, final).
+2. **Causality & streaming readiness** — all convolutions are strictly causal; state can be maintained across frames without future leakage.
+3. **Numerical robustness** — no NaN/Inf on real code sequences; output clamped to [-1, 1]; non-silent, reasonable RMS on valid input.
+4. **Regression** — `cargo test --release` (including alignment_verification and audio_output_verification) passes 100%.
+5. **Weight compatibility** — loads from both full `speech_tokenizer/model.safetensors` (hf_original / converted) and extracted `alignments/tokenizer_decoder.safetensors`.
+
+(25 Hz / DiT / flow-matching acceptance is out of scope for this spec until a separate tokenizer port is started.)
+
+---
+
+## 6. Architecture Overview — Qwen3-TTS-Tokenizer-12Hz Codec Decoder (Current Implementation)
+
+The 12Hz tokenizer (official `Qwen/Qwen3-TTS-Tokenizer-12Hz`) uses a **16-codebook (1+15 RVQ) causal ConvNet decoder**. This is what `CodecDecoder` in `pipeline.rs` implements.
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    TtsDecoder (trait)                    │
-├──────────────────────┬──────────────────────────────────┤
-│   Decoder12Hz        │        Decoder25Hz               │
-│   ┌──────────────┐   │   ┌────────────────────────┐     │
-│   │ CodebookEmb  │   │   │ FlowMatchingDiT        │     │
-│   │ (16 layers)  │   │   │ (block-wise diffusion) │     │
-│   │ rayon par    │   │   └────────────────────────┘     │
-│   └──────────────┘   │   ┌────────────────────────┐     │
-│   ┌──────────────┐   │   │ Chunk Scheduler        │     │
-│   │ CausalConv   │   │   └────────────────────────┘     │
-│   │ (ring buf)   │   │                                  │
-│   └──────────────┘   │                                  │
-│   ┌──────────────┐   │                                  │
-│   │ MTP Head     │   │                                  │
-│   └──────────────┘   │                                  │
-├──────────────────────┴──────────────────────────────────┤
-│              Vocoder (HiFi-GAN / Vocos)                  │
-├─────────────────────────────────────────────────────────┤
-│              Audio Output (PCM f32 / WAV)                │
-└─────────────────────────────────────────────────────────┘
+Input: 16 code tensors [B, T]  (u32/i64, 0-based into 2048-entry codebooks)
+          │
+          ▼
+┌────────────────────────────────────────────────────────────┐
+│ 1. SplitResidualVectorQuantizer (RVQ decode)               │
+│    - rvq_first (semantic, 1 layer) + rvq_rest (acoustic,15)│
+│    - codebook lookup + residual sum → [B, 512, T]          │
+└────────────────────────────────────────────────────────────┘
+          │
+          ▼
+┌────────────────────────────────────────────────────────────┐
+│ 2. pre_conv (CausalConv1d k=3, 512→1024)                   │
+└────────────────────────────────────────────────────────────┘
+          │
+          ▼
+┌────────────────────────────────────────────────────────────┐
+│ 3. pre_transformer (8 layers GQA + SwiGLU, causal mask)    │
+│    [B, 1024, T] → transpose → [B, T, 1024] → blocks → ...  │
+└────────────────────────────────────────────────────────────┘
+          │
+          ▼
+┌────────────────────────────────────────────────────────────┐
+│ 4. UpsampleStage × 2 (ConvTranspose stride-2 + ConvNeXt)   │
+│    → [B, 1024, T×4]                                        │
+└────────────────────────────────────────────────────────────┘
+          │
+          ▼
+┌────────────────────────────────────────────────────────────┐
+│ 5. TokenizerDecoder (post-transformer conv stack)          │
+│    - decoder.0.conv (pre-proj)                             │
+│    - 4× DecoderBlock (SnakeBeta + CausalTransConv +        │
+│      3× ResidualUnit dil=1,3,9)  upsample rates [8,5,4,3]  │
+│    - final SnakeBeta + Conv1d → [B, 1, T×1920]             │
+│    - clamp [-1, 1]                                         │
+└────────────────────────────────────────────────────────────┘
+          │
+          ▼
+Output: waveform [B, 1, samples] f32 @ 24 kHz
+(1920 samples per input frame → exactly 12.5 Hz)
 ```
+
+**Key properties (official + current code)**:
+- Total upsample: 4 (from the two UpsampleStages) × 480 (8×5×4×3 from decoder blocks) = 1920×.
+- All convs are strictly causal (left-pad only for encode-side, right-crop only for transposed convs).
+- SnakeBeta: `y = x + sin²(α·x) / (β + 1e-9)` with `α=exp(α_log)`, `β=exp(β_log)`.
+- No DiT / flow-matching in this path (those belong to the separate 25 Hz tokenizer).
+
+(The old simplistic "CodebookEmb + CausalConv + MTP" diagram was from a different port and does not match the actual Qwen3-TTS-12Hz decoder stack.)
 
 ---
 
-## 7. Module Breakdown (Proposed)
+## 7. Module Breakdown (Qwen3-TTS-Tokenizer-12Hz Codec Decoder)
 
-| Module | Responsibility | Key Crate |
-|---|---|---|
-| `codebook` | Embedding lookup, 16-layer parallel decode | `rayon`, `candle` |
-| `causal_conv` | Streaming causal convolution with ring buffer | `candle` |
-| `mtp` | Multi-token prediction head | `candle` |
-| `flow_matching` | Block-wise flow matching DiT (25 Hz) | `candle` |
-| `vocoder` | Waveform synthesis from mel/codec tokens | `candle` |
-| `tokenizer` | Load `tokenizer.json`, encode text → tokens | `serde_json` |
-| `stream` | Async chunk scheduling, tokio channels | `tokio` |
-| `weights` | SafeTensors weight loading & validation | `safetensors-rs` |
-| `audio` | WAV/PCM encode-decode | `hound`, `symphonia` |
+| Module (current crate) | Responsibility | Notes |
+|---|----|----|
+| `quantizer` (RVQ + EuclideanCodebook) | 16-layer codebook lookup + residual sum (semantic + 15 acoustic) | Uses normalized `embedding_sum / cluster_usage` |
+| `causal_conv` | `CausalConv1dLayer`, `CausalConvTranspose1dLayer` (left-pad, right-crop only) | Strict causality |
+| `conv_decoder` | `ResidualUnit` (dil 1/3/9), `DecoderBlock`, `TokenizerDecoder` (full SEANet-style stack) | SnakeBeta, upsample [8,5,4,3] |
+| `pipeline` (`CodecDecoder`) | Full end-to-end: quantizer → pre_conv → pre_transformer (8L) → upsample×2 → tokenizer_decoder | The main "12Hz causal decoder" entry point |
+| `transformer` | GQA pre_transformer blocks (causal mask, RoPE, SwiGLU, LayerScale) | 8 layers for the 12Hz path |
+| `weights` / `ComponentWeights` | SafeTensors loading with "decoder." prefix scoping | Supports both full speech_tokenizer and extracted decoder-only safetensors |
+| `custom_ops` | `snake_beta`, `causal_pad_left`, `causal_crop_right`, `causal_mask` | |
+| `alignment` (tests) | Cosine similarity helpers for PyTorch reference verification | Target ≥ 0.999 layer-wise |
+
+**Out of scope for this codec-decoder port** (belong to the separate 25 Hz tokenizer or full LM):
+- Flow-matching DiT / block-wise diffusion
+- BigVGAN vocoder
+- The 25 Hz single-codebook path
+
+(The old "MTP Head" and simple "CodebookEmb" modules listed in earlier drafts do not apply to the decoder side of the 12Hz tokenizer; MTP lives in the talker / code-predictor for token *generation*.)
 
 ---
 
@@ -183,23 +240,31 @@ pub trait TtsDecoder: Send + Sync {
 
 ---
 
-## 9. Milestones
+## 9. Milestones (12Hz Tokenizer Decoder focus)
 
 | Phase | Deliverable | Target |
-|---|---|---|
-| **Phase 0** | Project scaffold, weight loader, tokenizer | Week 1 |
-| **Phase 1** | 12 Hz codebook + causal conv (CPU) | Week 2–3 |
-| **Phase 2** | 12 Hz GPU (CUDA), numerical alignment verified | Week 4 |
-| **Phase 3** | 25 Hz flow matching DiT | Week 5–6 |
-| **Phase 4** | Vocoder integration, streaming pipeline | Week 7 |
-| **Phase 5** | Regression suite, perf benchmarks, Metal port | Week 8 |
+|---|----|----|
+| **Phase 0** | Scaffold, WeightStore, ComponentWeights, basic quantizer | Done |
+| **Phase 1** | Full `CodecDecoder` (RVQ + pre_conv + pre_transformer + upsample + TokenizerDecoder) on CPU | Done (basic forward works) |
+| **Phase 2** | Causal correctness, SnakeBeta, transposed-conv right-crop, dilations 1/3/9 verified in unit tests | In progress |
+| **Phase 3** | Numerical alignment harness using `weights/intermediates/` + `weights/alignments/tokenizer_decoder.safetensors`; cosine ≥ 0.999 on real activations | Next priority |
+| **Phase 4** | `decoder_test` + integration tests produce bit-identical or high-cosine matching audio vs Python reference on the same tokens/weights |  |
+| **Phase 5** | Talker / code-predictor integration (if in scope), full end-to-end with real text frontend tokens |  |
+| **Later** | 25 Hz (DiT) tokenizer decoder, Metal optimization, production streaming | Out of current 12Hz decoder scope |
 
 ---
 
-## 10. Open Questions
+## 10. Open Questions & Notes
 
-- [ ] Which vocoder does Qwen3-TTS use? (HiFi-GAN, Vocos, or custom?)
-- [ ] Are the 16 codebook layers independent or have cross-layer attention?
-- [ ] What is the exact MTP (multi-token prediction) architecture?
-- [ ] Is there an official SafeTensors weight file available, or must we convert from PyTorch `.pt`?
-- [ ] What sample rate does the vocoder output? (24 kHz assumed)
+**Resolved / Verified (2026-06-03 via official HF + paper)**:
+- Tokenizer name: Qwen3-TTS-Tokenizer-12Hz (marketed "12Hz", operates at **12.5 Hz**).
+- Decoder for this tokenizer: pure causal ConvNet (no DiT). The DiT path belongs to the separate 25 Hz tokenizer.
+- Sample rate: 24 kHz. 1920 samples per codec frame.
+- Weights: provided as SafeTensors (both full speech_tokenizer and extracted decoder subsets exist in this repo under `weights/`).
+
+**Remaining (for full system, not just codec decoder)**:
+- Exact talker + MTP architecture for token *generation* (this spec is decoder-only).
+- Whether the current `hf_original/speech_tokenizer` vs `alignments/tokenizer_decoder.safetensors` + `test_input.safetensors` are bit-compatible for numerical alignment tests.
+- Full end-to-end latency numbers on this Rust port (target inherited from paper: ~97 ms first packet in the complete system).
+
+**Note on copied documentation**: Several files under `docs/` (e.g. `codec_decode_voice_fix_2026-06-02.md`) were brought in from other Qwen3-TTS Rust ports. They contain valuable implementation lessons (causal padding, SnakeBeta formula, right-only crop on transposed conv, dilation schedule, full-batch vs per-frame decode) but use class names ("Decoder12Hz") and file layouts from those ports. Treat them as reference, not literal spec for this codebase. The canonical architecture is the one in `crates/qwen-vox-core/src/pipeline.rs` + `conv_decoder.rs`.

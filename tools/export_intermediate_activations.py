@@ -1,194 +1,146 @@
 #!/usr/bin/env python3
 """
-Export intermediate activations from Qwen3-TTS tokenizer decoder for alignment testing.
+Export intermediate activations from Qwen3-TTS-Tokenizer-12Hz for Rust alignment verification.
 
-This script loads the converted SafeTensors weights and simulates the forward pass,
-saving intermediate tensors at each stage:
-  - split_rvq_out: After SplitRVQ decode
-  - pre_conv_out: After pre_conv
-  - transformer_out: After pre_transformer (8 layers)
-  - decoder_block_0_out, decoder_block_1_out, ...: After each decoder block
-  - final_out: Final audio output
-
-Usage:
-    python export_intermediate_activations.py --weights weights/converted/tokenizer \
-        --output weights/intermediates --codes test_codes.safetensors
+This script runs a forward pass through the PyTorch tokenizer and saves intermediate
+activations at each stage for comparison with the Rust implementation.
 """
 
 import argparse
-import json
+import os
 import sys
-from pathlib import Path
 
 try:
     import torch
-    from safetensors import safe_open
     from safetensors.torch import save_file
 except ImportError:
-    print("ERROR: pip install torch safetensors")
+    print("ERROR: torch/safetensors not installed. Run: pip install torch safetensors")
     sys.exit(1)
 
+try:
+    from qwen_tts import Qwen3TTSTokenizer
+except ImportError:
+    print("ERROR: qwen-tts not installed. Run: pip install qwen-tts")
+    sys.exit(1)
 
-def load_tensor(store, name):
-    """Load a tensor from the store, handling optional bias."""
-    if name in store:
-        return store[name]
-    return None
-
-
-def simulate_split_rvq(codes, store):
-    """
-    Simulate SplitRVQ decode.
-
-    In real implementation, this would:
-    1. Lookup embeddings from 16 codebooks
-    2. Sum semantic + acoustic residuals
-    3. Apply output_proj (Conv1d k=1)
-    """
-    # For now, return a placeholder with expected shape
-    # [batch, 512, seq_len]
-    batch = codes[0].shape[0] if len(codes) > 0 else 1
-    seq_len = codes[0].shape[1] if len(codes) > 0 else 8
-    return torch.zeros(batch, 512, seq_len)
-
-
-def simulate_pre_conv(x, store):
-    """Simulate pre_conv: CausalConv1d [1024, 512, 3]"""
-    weight = store.get("pre_conv.conv.weight")
-    bias = store.get("pre_conv.conv.bias")
-
-    if weight is not None:
-        # Conv1d: [batch, in_ch, len] -> [batch, out_ch, len]
-        # For causal conv, we need to pad left
-        x_padded = torch.nn.functional.pad(x, (2, 0))  # pad left by 2
-        out = torch.nn.functional.conv1d(x_padded, weight, bias, stride=1, padding=0)
-        return out
-    return torch.zeros(x.shape[0], 1024, x.shape[2])
-
-
-def simulate_transformer(x, store, num_layers=8):
-    """
-    Simulate pre_transformer: 8-layer AR Transformer.
-
-    Input: [batch, seq_len, 512] (after transpose from conv output)
-    Output: [batch, seq_len, 512]
-    """
-    # For alignment testing, we just return the input shape
-    # Real implementation would run through all 8 layers
-    return x
-
-
-def simulate_decoder_block(x, store, block_idx):
-    """
-    Simulate a single decoder block:
-      SnakeBeta -> CausalConvTranspose1d -> 3x ResidualUnit
-    """
-    # Placeholder
-    return x
-
-
-def simulate_final_stage(x, store):
-    """Simulate final SnakeBeta + Conv1d -> mono audio"""
-    # Placeholder
-    return torch.zeros(x.shape[0], 1, x.shape[2] * 192)  # rough upsample ratio
+import numpy as np
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Export intermediate activations")
-    parser.add_argument(
-        "--weights",
-        "-w",
-        required=True,
-        help="Directory containing converted tokenizer weights",
+    parser = argparse.ArgumentParser(
+        description="Export intermediate activations from Qwen3-TTS tokenizer"
     )
     parser.add_argument(
         "--output",
         "-o",
-        required=True,
-        help="Output directory for intermediate tensors",
+        default="weights/intermediates/intermediates.safetensors",
+        help="Output path for intermediates",
     )
     parser.add_argument(
-        "--codes", "-c", help="Optional: SafeTensors file with test codes"
+        "--model",
+        default="Qwen/Qwen3-TTS-Tokenizer-12Hz",
+        help="Model ID or local path",
     )
+    parser.add_argument("--device", default="cpu", help="Device to run on")
     args = parser.parse_args()
 
-    weights_dir = Path(args.weights)
-    output_dir = Path(args.output)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["HF_HOME"] = os.path.abspath(".cache/huggingface")
 
-    print(f"Loading weights from: {weights_dir}")
-    print(f"Output directory: {output_dir}")
+    print(f"Loading tokenizer from: {args.model}")
+    tokenizer = Qwen3TTSTokenizer.from_pretrained(
+        args.model,
+        device_map=args.device,
+        dtype=torch.float32,
+    )
+    print("Tokenizer loaded!")
 
-    # Load all tensors from the converted tokenizer weights
-    weight_store = {}
-    model_path = weights_dir / "model.safetensors"
+    # Create test audio (sine wave at 440Hz for 1 second)
+    sr = 24000
+    t = np.linspace(0, 1, sr, endpoint=False)
+    test_audio = 0.3 * np.sin(2 * np.pi * 440 * t).astype(np.float32)
 
-    if model_path.exists():
-        with safe_open(str(model_path), framework="pt", device="cpu") as f:
-            for name in f.keys():
-                weight_store[name] = f.get_tensor(name)
-        print(f"Loaded {len(weight_store)} tensors")
-    else:
-        print(f"WARNING: {model_path} not found")
-        return
+    # Encode
+    print("Encoding test audio...")
+    codes = tokenizer.encode(test_audio, sr)
+    codes_tensor = codes.audio_codes[0]  # [13, 16]
+    print(f"Codes shape: {codes_tensor.shape}")
 
-    # Generate or load test codes
-    if args.codes:
-        codes_path = Path(args.codes)
-        with safe_open(str(codes_path), framework="pt", device="cpu") as f:
-            codes = [f.get_tensor(f"code_{i}") for i in range(16)]
-        print(f"Loaded test codes from {codes_path}")
-    else:
-        # Generate dummy codes
-        torch.manual_seed(42)
-        codes = [torch.randint(0, 2048, (1, 8)) for _ in range(16)]
-        print("Generated dummy test codes")
+    # Get the internal model
+    model = tokenizer.model
 
-    # Simulate forward pass and save intermediates
-    intermediates = {}
+    # Run through decoder step by step
+    print("Running decoder forward pass...")
 
-    # Stage 1: SplitRVQ
-    rvq_out = simulate_split_rvq(codes, weight_store)
-    intermediates["split_rvq_out"] = rvq_out
-    print(f"split_rvq_out: {list(rvq_out.shape)}")
+    decoder = model.decoder
 
-    # Stage 2: pre_conv
-    pre_conv_out = simulate_pre_conv(rvq_out, weight_store)
-    intermediates["pre_conv_out"] = pre_conv_out
-    print(f"pre_conv_out: {list(pre_conv_out.shape)}")
+    # 1. SplitRVQ quantizer
+    print("  Stage 1: SplitRVQ quantizer...")
+    quantizer_out = decoder.quantizer.decode(codes_tensor)  # [B, 512, T]
+    print(f"    quantizer_out shape: {quantizer_out.shape}")
 
-    # Stage 3: pre_transformer (need to transpose to [batch, seq_len, ch])
-    x_t = pre_conv_out.transpose(1, 2)  # [batch, seq_len, ch]
-    transformer_out = simulate_transformer(x_t, weight_store)
-    intermediates["transformer_out"] = transformer_out
-    print(f"transformer_out: {list(transformer_out.shape)}")
+    # 2. Pre-conv
+    print("  Stage 2: Pre-conv...")
+    pre_conv_out = decoder.pre_conv(quantizer_out)  # [B, 1024, T]
+    print(f"    pre_conv_out shape: {pre_conv_out.shape}")
 
-    # Stage 4: decoder blocks (transpose back to [batch, ch, len])
-    x = transformer_out.transpose(1, 2)
-    for i in range(4):
-        x = simulate_decoder_block(x, weight_store, i)
-        intermediates[f"decoder_block_{i}_out"] = x
-        print(f"decoder_block_{i}_out: {list(x.shape)}")
+    # 3. Pre-transformer
+    print("  Stage 3: Pre-transformer...")
+    # Transpose for transformer: [B, C, T] → [B, T, C]
+    pt_in = pre_conv_out.transpose(1, 2)
+    pt_out = decoder.pre_transformer(pt_in)  # [B, T, 1024]
+    pt_out = pt_out.transpose(1, 2)  # [B, 1024, T]
+    print(f"    pre_transformer_out shape: {pt_out.shape}")
 
-    # Stage 5: final
-    final_out = simulate_final_stage(x, weight_store)
-    intermediates["final_out"] = final_out
-    print(f"final_out: {list(final_out.shape)}")
+    # 4. Upsample
+    print("  Stage 4: Upsample...")
+    up_out = pt_out
+    for i, stage in enumerate(decoder.upsample):
+        up_out = stage(up_out)
+        print(f"    upsample stage {i} shape: {up_out.shape}")
 
-    # Save all intermediates (clone + contiguous to avoid safetensors issues)
-    intermediates_clean = {k: v.clone().contiguous() for k, v in intermediates.items()}
-    save_file(intermediates_clean, str(output_dir / "intermediates.safetensors"))
-    print(f"\nSaved intermediates to: {output_dir / 'intermediates.safetensors'}")
+    # 5. Decoder blocks
+    print("  Stage 5: Decoder blocks...")
+    dec_out = up_out
+    for i, block in enumerate(decoder.decoder):
+        dec_out = block(dec_out)
+        print(f"    decoder_block_{i}_out shape: {dec_out.shape}")
 
-    # Save metadata
-    meta = {
-        "codes_shape": [list(c.shape) for c in codes],
-        "stages": list(intermediates.keys()),
+    # 6. Final snake + conv
+    print("  Stage 6: Final conv...")
+    final_snake_out = decoder.final_snake(dec_out)
+    final_out = decoder.final_conv(final_snake_out)
+    print(f"    final_out shape: {final_out.shape}")
+
+    # Clamp to [-1, 1]
+    final_out = final_out.clamp(-1, 1)
+
+    # Save intermediates
+    intermediates = {
+        "split_rvq_out": quantizer_out.detach().cpu(),
+        "pre_conv_out": pre_conv_out.detach().cpu(),
+        "transformer_out": pt_out.detach().cpu(),
+        "upsample_out": up_out.detach().cpu(),
+        "decoder_block_0_out": decoder.decoder[0](up_out).detach().cpu()
+        if len(decoder.decoder) > 0
+        else None,
+        "final_out": final_out.detach().cpu(),
     }
-    with open(output_dir / "intermediates_meta.json", "w") as f:
-        json.dump(meta, f, indent=2)
 
-    print("[OK] Export complete!")
+    # Remove None entries
+    intermediates = {k: v for k, v in intermediates.items() if v is not None}
+
+    # Also save the codes
+    intermediates["codes"] = codes_tensor.detach().cpu()
+
+    # Save to file
+    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    save_file(intermediates, args.output)
+    print(f"\nSaved intermediates to: {args.output}")
+
+    # Print summary
+    print("\nIntermediate shapes:")
+    for name, tensor in intermediates.items():
+        print(f"  {name}: {list(tensor.shape)}")
 
 
 if __name__ == "__main__":

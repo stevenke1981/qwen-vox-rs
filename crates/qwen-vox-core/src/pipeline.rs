@@ -5,15 +5,15 @@
 //!    codes → SplitRVQ quantizer → pre_conv → pre_transformer
 //!           → upsample (×2) → tokenizer_decoder → waveform
 //!
-//! Pipeline stages (`decoder.*` prefix in tokenizer weights):
+//! Pipeline stages (official PyTorch prefixes, all under top-level `decoder.*` in the safetensors):
 //!
-//! | Stage                    | Weight prefix               | Input → Output dims         |
-//! |--------------------------|-----------------------------|-----------------------------|
-//! | 1. SplitRVQ quantizer    | `quantizer.rvq_{first,rest}`| [B, T] × 16 → [B, 512, T]  |
-//! | 2. Pre-conv (CausalConv) | `pre_conv`                  | [B, 512, T] → [B, 1024, T] |
-//! | 3. Pre-transformer (8×)  | `pre_transformer`           | [B, 1024, T] → [B, 1024, T] |
-//! | 4. Upsample (2×)         | `upsample.{0,1}`            | [B, 1024, T] → [B, 1024, T×4] |
-//! | 5. TokenizerDecoder      | `decoder` (prefix)          | [B, 1024, T×4] → [B, 1, T×1920] |
+//! | Stage                    | Weight prefix (official)          | Input → Output dims         |
+//! |--------------------------|-----------------------------------|-----------------------------|
+//! | 1. SplitRVQ quantizer    | `decoder.quantizer.rvq_{first,rest}` | [B, T] × 16 → [B, 512, T]  |
+//! | 2. Pre-conv (CausalConv) | `decoder.pre_conv`                | [B, 512, T] → [B, 1024, T] |
+//! | 3. Pre-transformer (8×)  | `decoder.pre_transformer`         | [B, 1024, T] → [B, 1024, T] |
+//! | 4. Upsample (2×)         | `decoder.upsample.{0,1}`          | [B, 1024, T] → [B, 1024, T×4] |
+//! | 5. TokenizerDecoder      | `decoder.decoder` (sub)           | [B, 1024, T×4] → [B, 1, T×1920] |
 //!
 //! Total upsampling rate: 4× (upsample) × 480× (decoder blocks) = 1920×.
 //! At 24 kHz, this is 12.5 codec frames per second.
@@ -170,7 +170,8 @@ struct UpsampleStage {
 
 impl UpsampleStage {
     fn from_weights(weights: &ComponentWeights, stage_idx: usize) -> VoxResult<Self> {
-        let prefix = format!("upsample.{stage_idx}");
+        // official: decoder.upsample.{i}.0.conv... and decoder.upsample.{i}.1.*
+        let prefix = format!("decoder.upsample.{stage_idx}");
 
         let ct_w = weights.require(&format!("{prefix}.0.conv.weight"))?.clone();
         let ct_b = Some(weights.require(&format!("{prefix}.0.conv.bias"))?.clone());
@@ -213,23 +214,26 @@ impl CodecDecoder {
 
     /// Build the decoder from the tokenizer weight store.
     ///
-    /// The tokenizer weight store must contain all `decoder.*` keys
-    /// (quantizer, pre_conv, pre_transformer, upsample, conv decoder blocks).
+    /// The tokenizer weight store must contain all official `decoder.*` keys
+    /// (decoder.quantizer.*, decoder.pre_conv.*, decoder.pre_transformer.*,
+    ///  decoder.upsample.*, decoder.decoder.* for the conv stack).
     pub fn from_weights(store: WeightStore) -> VoxResult<Self> {
         // ── Load codebook embeddings first (before ComponentWeights wraps store) ──
         let codebooks = load_decoder_codebooks(&store)?;
-        let weights = ComponentWeights::new(store, "decoder");
+        // Use empty prefix so that all require() calls below use the *official* full key names
+        // exactly as they appear in the PyTorch SafeTensors (e.g. "decoder.pre_conv...", "decoder.decoder.0...", "decoder.pre_transformer...").
+        let weights = ComponentWeights::new(store, "");
 
         // ── 1. Quantizer ──
         // rvq_first: 1 layer (index 0 from codebooks)
-        let rvq_first = Self::build_rvq(&weights, "quantizer.rvq_first", &codebooks[..1])?;
+        let rvq_first = Self::build_rvq(&weights, "decoder.quantizer.rvq_first", &codebooks[..1])?;
         // rvq_rest: 15 layers (indices 1..=15 from codebooks)
-        let rvq_rest = Self::build_rvq(&weights, "quantizer.rvq_rest", &codebooks[1..=15])?;
+        let rvq_rest = Self::build_rvq(&weights, "decoder.quantizer.rvq_rest", &codebooks[1..=15])?;
         let quantizer = SplitResidualVectorQuantizer::from_weights(rvq_first, rvq_rest)?;
 
         // ── 2. Pre-conv: 512 → 1024, k=3, causal ──
-        let pc_w = weights.require("pre_conv.conv.weight")?.clone();
-        let pc_b = Some(weights.require("pre_conv.conv.bias")?.clone());
+        let pc_w = weights.require("decoder.pre_conv.conv.weight")?.clone();
+        let pc_b = Some(weights.require("decoder.pre_conv.conv.bias")?.clone());
         let pre_conv = CausalConv1dLayer::from_weights(pc_w, pc_b, 1, 1, 1)?;
 
         // ── 3. Pre-transformer: 8× GQA + SwiGLU blocks ──
@@ -302,7 +306,8 @@ impl CodecDecoder {
     }
 
     fn build_pre_transformer(weights: &ComponentWeights) -> VoxResult<TransformerStack> {
-        let pf = "pre_transformer";
+        // Use official PyTorch prefix under decoder (note: 8 layers in this model, not 12)
+        let pf = "decoder.pre_transformer";
 
         // Input projection: 1024 → 512
         let in_w = weights.require(&format!("{pf}.input_proj.weight"))?.clone();
