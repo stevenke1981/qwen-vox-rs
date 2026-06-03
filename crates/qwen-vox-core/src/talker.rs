@@ -692,9 +692,19 @@ impl Talker {
             .require(&format!("{prefix}.post_attention_layernorm.weight"))?
             .clone();
 
-        // No Q/K norms, no LayerScale in code predictor
-        let q_norm: Option<Tensor> = None;
-        let k_norm: Option<Tensor> = None;
+        // Official code predictor uses Qwen3TTSDecoderLayer, which includes
+        // per-head Q/K RMSNorm just like the main talker backbone.
+        let q_norm = Some(
+            store
+                .require(&format!("{prefix}.self_attn.q_norm.weight"))?
+                .clone(),
+        );
+        let k_norm = Some(
+            store
+                .require(&format!("{prefix}.self_attn.k_norm.weight"))?
+                .clone(),
+        );
+        // No LayerScale in code predictor.
         let als: Option<Tensor> = None;
         let mls: Option<Tensor> = None;
 

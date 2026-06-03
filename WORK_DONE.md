@@ -62,6 +62,17 @@ Latest validation:
     `32.25`.
   - Current remaining mismatch is frame0 residual code predictor q1..q15, so
     subsequent q0 frames diverge after the first frame.
+- Code predictor Q/K norm fix:
+  - Official code predictor uses `Qwen3TTSDecoderLayer`, which includes
+    per-head `q_norm` / `k_norm`.
+  - Rust previously loaded code predictor blocks without Q/K norms.
+  - After loading these norms, Rust frame0 matches official exactly for all
+    16 codebooks:
+    `[1995, 1159, 355, 22, 1174, 1093, 625, 1814, 1058, 905, 1846, 1247, 1677, 889, 812, 901]`.
+  - Argmax16 comparison now has first mismatch at frame 1 instead of frame 0;
+    q0 match rate improved to about `0.733`.
+  - Remaining work: incremental generation parity after the first generated
+    frame, especially residual code predictor q9+ and subsequent q0 drift.
 
 ## Completed In This Stage
 
@@ -113,6 +124,7 @@ Latest validation:
 - `crates/qwen-vox-core/src/talker.rs`
   - Adds optional first-frame q0 logits top-k dump through
     `QWEN_VOX_DUMP_Q0_TOPK`.
+  - Code predictor transformer blocks now load official q/k RMSNorm weights.
 - `OFFICIAL_QWEN3_TTS_REFERENCE_FLOW.md`
   - Complete official flow record and Rust rewrite target order.
 - `plan.md`
