@@ -16,6 +16,23 @@ from upstream and causes high-frequency noise instead of human speech.
 - Speech tokenizer config:
   `weights/hf_original/speech_tokenizer/config.json`
 
+## Verified Human-Voice Reference
+
+The first verified official end-to-end reference is documented in:
+
+- `OFFICIAL_QWEN3_TTS_REFERENCE_FLOW.md`
+
+The output file is:
+
+- `out/official_qwen3_reference.wav`
+
+This file is confirmed by listening as normal human speech. It is the current
+golden reference for Rust end-to-end work.
+
+Do not use `out/python_decoder_test_output.wav` as a speech-quality reference:
+that file decodes fixed test tokens and can sound like high-frequency noise even
+when the decoder is numerically useful.
+
 ## Official CustomVoice Flow
 
 1. Build assistant text.
