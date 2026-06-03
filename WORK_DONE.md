@@ -37,6 +37,14 @@ Latest validation:
 - Rust tokenizer now loads the official HF tokenizer directory
   `weights/hf_original` and matches the verified official prompt token IDs:
   23 tokens for `<|im_start|>assistant\n你好，這是官方 Qwen3 TTS 參考語音。...`.
+- Deterministic codec-frame parity baseline has been generated:
+  - Official argmax16 codes: `out/official_qwen3_reference_argmax16_codes.npy`
+  - Rust argmax16 dump: `out/rust_official_prompt_argmax16_frames.json`
+  - Compare result: 0 matching frames, first mismatch at frame 0.
+  - Official q0 head: `[1995, 1028, 2007, 1059, 1696, 933, 933, 1948]`
+  - Rust q0 head: `[968, 968, 968, 968, 968, 968, 968, 968]`
+  - Conclusion: after token parity, the next failure is in talker prompt
+    embedding / position-cache / q0 logits, not the waveform decoder.
 
 ## Completed In This Stage
 
@@ -95,9 +103,8 @@ Latest validation:
    - stopping/EOS behavior
    - sampling defaults and prompt layout
 4. If generated code frames diverge immediately, continue fixing talker:
-   - prompt/prefill layout
-   - causal masks and position IDs
-   - KV cache position handling
+   - prompt/prefill layout and generated hidden-state position
+   - causal masks and position IDs/cache positions
    - code predictor residual generation
    - sampling / repetition penalty rules
 5. Only mark the project successful when the compiled Rust CLI produces a WAV that can be clearly heard as human speech.
