@@ -88,6 +88,10 @@ Latest validation:
   - Verified `SpeakerEncoder::forward` with unit tests and a local ignored
     smoke test against `weights/model-0.6b/model.safetensors`; output shape is
     `[1, 1024]`.
+  - Added Qwen3-TTS speaker mel preprocessing in Rust:
+    24 kHz validation, `n_fft=1024`, `hop=256`, `win=1024`, `n_mels=128`,
+    `fmax=12000`, reflect padding, Hann-window STFT, Slaney mel filterbank, and
+    log dynamic range compression.
 - Minnan / Taiwan Taigi feature reference:
   - Added `docs/qwen3_tts_minnan_hokkien_guide.md` with Qwen3-TTS Voice Design,
     CustomVoice, and Voice Clone usage targets for Minnan / Hokkien / Taiwan

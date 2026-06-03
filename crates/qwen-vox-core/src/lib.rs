@@ -7,6 +7,7 @@
 //! - **25 Hz** — high-quality synthesis (Block-wise Flow Matching DiT)
 
 pub mod alignment;
+pub mod audio_features;
 pub mod causal_conv;
 pub mod codebook;
 pub mod config;
