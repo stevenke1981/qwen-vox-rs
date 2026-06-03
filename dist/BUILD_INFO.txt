@@ -1,6 +1,6 @@
 ﻿qwen-vox-rs release build
-commit=e6f89d0
-built_at_utc=2026-06-03T15:41:43Z
+commit=a50c515
+built_at_utc=2026-06-03T16:04:37Z
 cpu=dist\qwen-vox-cpu.exe
 cuda=dist\qwen-vox-cuda.exe
 

@@ -53,6 +53,11 @@ Latest validation:
   - Documented the default `weights/hf_original` directory structure.
   - Documented current generation speed limits: one-shot CLI weight loading,
     manual Candle attention, and per-frame/per-residual incremental generation.
+  - Rebuilt `dist\qwen-vox-cpu.exe` and `dist\qwen-vox-cuda.exe`.
+  - Verified release CUDA reproducibility: two runs with
+    `--seed 1234 --speed 1.25 --max-frames 16` produced identical codec-frame
+    JSON and identical WAV hashes.
+  - Verified `--speed 1.25` shortened the 16-frame output to 24576 samples.
 - `python tools\generate_official_reference.py --help` succeeds.
 - `cargo check -p qwen-vox-cli --features cuda` succeeds without warnings.
 - Rust CLI can now dump generated codec frames before decode via
